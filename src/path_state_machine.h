@@ -171,9 +171,9 @@ MQVPN_INTERNAL int path_is_real_transition(mqvpn_path_status_t old,
 /* PR4 - Path retry/stability constants (relocated from mqvpn_client.c).
  * Both mqvpn_client.c (for logging) and path_state_machine.c (for retry
  * helper + stable timer) need these. */
-#define PATH_RECREATE_DELAY_US     (5ULL * 1000000)  /* 5 sec initial */
-#define PATH_RECREATE_MAX_DELAY_US (60ULL * 1000000) /* 60 sec max backoff */
-#define PATH_RECREATE_MAX_RETRIES  6                 /* max consecutive failures */
+#define PATH_RECREATE_DELAY_US     (1ULL * 1000000)  /* 1 sec initial */
+#define PATH_RECREATE_MAX_DELAY_US (3ULL * 1000000)  /* 3 sec max backoff */
+#define PATH_RECREATE_MAX_RETRIES  100000            /* continuous retry without giving up */
 #define PATH_STABLE_THRESHOLD_US   (30ULL * 1000000) /* 30 sec to confirm stable */
 
 /* PR4 - Relocated from mqvpn_client.c (originally static). path_on_event()

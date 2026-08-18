@@ -66,11 +66,11 @@
 #define PACKET_BUF_SIZE           65536
 #define MASQUE_FRAME_BUF          (PACKET_BUF_SIZE + 16)
 #define MAX_CAPSULE_BUF           65536
-#define RECONNECT_BACKOFF_MAX_SEC 60
+#define RECONNECT_BACKOFF_MAX_SEC 6
 /* Force-close the QUIC handshake if it doesn't progress past CONNECTING within
  * this window, so a dead first-listed path triggers reconnect (and primary_path_idx
  * rotation, issue #46) rather than waiting for xquic's idle_time_out (120s). */
-#define HANDSHAKE_STALL_TIMEOUT_MS 5000
+#define HANDSHAKE_STALL_TIMEOUT_MS 2500
 /* PATH_RECREATE_* and PATH_STABLE_THRESHOLD_US relocated to path_state_machine.h
  * for PR4 — shared with path_state_machine.c. */
 #define SOCKET_BUF_SIZE (7 * 1024 * 1024) /* 7 MiB socket buffer */
@@ -990,7 +990,7 @@ static int
 client_reconnect_delay_sec(const mqvpn_client_t *c)
 {
     int base = c->config.reconnect_interval_sec;
-    if (base <= 0) base = 5;
+    if (base <= 0) base = 3;
 
     int delay = base;
     for (int i = 0; i < c->reconnect_attempts && delay < RECONNECT_BACKOFF_MAX_SEC; i++)

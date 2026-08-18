@@ -110,6 +110,7 @@ mqvpn_apply_reinjection(const mqvpn_conn_settings_input_t *in, xqc_conn_settings
     case MQVPN_REINJ_DGRAM:
         cs->reinj_ctl_callback = xqc_dgram_reinj_ctl_cb;
         cs->mp_enable_reinjection = XQC_REINJ_UNACK_AFTER_SEND;
+        cs->datagram_force_retrans_on = 1;
         break;
     }
 }
@@ -128,6 +129,9 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
     out->so_sndbuf = 8 * 1024 * 1024;
     out->idle_time_out = 120000;
     out->init_idle_time_out = 10000;
+    if (in->reinjection == MQVPN_REINJ_DGRAM) {
+        out->datagram_force_retrans_on = 1;
+    }
 
     /* Caller-gated, never derived here: see the field comment in
      * mqvpn_conn_settings.h for why this must equal the batched-send
@@ -158,7 +162,11 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
          * label stays so -Wswitch coverage holds in both build configs. */
         break;
     case MQVPN_CC_BBR2:
+#ifdef XQC_ENABLE_BBR2
         out->cong_ctrl_callback = xqc_bbr2_cb;
+#else
+        out->cong_ctrl_callback = xqc_bbr_cb;
+#endif
         out->cc_params.cc_optimization_flags =
             XQC_BBR2_FLAG_RTTVAR_COMPENSATION | XQC_BBR2_FLAG_FAST_CONVERGENCE;
         break;
