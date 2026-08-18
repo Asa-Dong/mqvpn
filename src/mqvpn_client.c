@@ -3980,23 +3980,35 @@ tick_path_recovery(mqvpn_client_t *c)
 
     uint64_t now = client_now_us(c);
     tick_check_all_validations(c, now);
-    int active_or_validating = 0;
+    int active_paths = 0;
+    int validating_paths = 0;
     for (int i = 0; i < c->n_paths; i++) {
         path_entry_t *p = &c->paths[i];
         client_path_residence_check(c, p, now);
         tick_drive_retry_timer(c, p, i, now);
         path_fsm_tick_confirm_stable(c, p, now);
-        if (p->state == PATH_LC_ACTIVE || p->state == PATH_LC_VALIDATING || p->state == PATH_LC_STANDBY) {
-            active_or_validating++;
-        }
+        if (p->state == PATH_LC_ACTIVE || p->state == PATH_LC_STANDBY)
+            active_paths++;
+        else if (p->state == PATH_LC_VALIDATING)
+            validating_paths++;
     }
 
-    if (active_or_validating == 0) {
+    if (active_paths == 0) {
+        /* A validating path is not usable for traffic.  If the last active
+         * path disappears while replacement paths are still validating,
+         * xquic may have no carrier left on which to send their PATH_CHALLENGE
+         * frames.  Waiting for the normal all-dead grace then leaves the
+         * connection ESTABLISHED forever with every path projected as pending.
+         * Give a genuine validation a short chance, then reconnect in-process
+         * so the next connection starts on one of the recovered underlays. */
+        uint64_t grace_us = validating_paths ? 1000000ULL : 3ULL * 1000000;
         if (c->all_paths_dead_since_us == 0) {
             c->all_paths_dead_since_us = now;
-        } else if (now - c->all_paths_dead_since_us > 3ULL * 1000000) {
+        } else if (now - c->all_paths_dead_since_us > grace_us) {
             c->all_paths_dead_since_us = 0;
-            client_force_reconnect(c, "all paths dead for >3s");
+            client_force_reconnect(c, validating_paths
+                                          ? "no active path; validation stalled for >1s"
+                                          : "all paths dead for >3s");
         }
     } else {
         c->all_paths_dead_since_us = 0;

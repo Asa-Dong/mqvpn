@@ -1288,34 +1288,24 @@ TEST(activation_failure_invalid_handle_returns_error)
     mqvpn_client_destroy(c);
 }
 
-TEST(activation_failure_eventually_closes_path)
+TEST(activation_failure_remains_recoverable)
 {
     mqvpn_client_t *c = make_test_client();
     mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
     ASSERT_NE(h, (mqvpn_path_handle_t)-1);
 
-    /* Hammer the failure path until the retry budget is exhausted.  We
-     * don't want the test to encode the exact PATH_RECREATE_MAX_RETRIES
-     * value, so we call enough times to overshoot any reasonable cap. */
+    /* R4S recovery keeps retrying rather than permanently abandoning an
+     * uplink after a transient multi-WAN CID shortage.  Repeated failures
+     * must therefore remain in the retryable public PENDING projection. */
     mqvpn_path_info_t info[2];
     int n = 0;
-    int closed = 0;
     for (int i = 0; i < 32; i++) {
         ASSERT_EQ(mqvpn_client_apply_path_activation_failure(c, h, 1000000), 0);
         mqvpn_client_get_paths(c, info, 2, &n);
         ASSERT_EQ(n, 1);
-        if (info[0].status == MQVPN_PATH_CLOSED) {
-            closed = 1;
-            break;
-        }
         /* PR3: pre-CLOSED retry slot is CREATE_WAIT (public PENDING),
          * not DEGRADED — there has been no validated experience yet. */
         ASSERT_EQ(info[0].status, MQVPN_PATH_PENDING);
-    }
-    if (!closed) {
-        printf("FAIL\n    %s:%d: path never reached CLOSED after 32 failures\n", __FILE__,
-               __LINE__);
-        exit(1);
     }
 
     mqvpn_client_destroy(c);
@@ -1710,7 +1700,7 @@ TEST(client_next_primary_idx_skips_closed_and_inactive)
 /* ── Handshake stall watchdog ──
  *
  * If the QUIC handshake doesn't progress past CONNECTING within
- * HANDSHAKE_STALL_TIMEOUT_MS (10s), the watchdog forces close → reconnect →
+ * HANDSHAKE_STALL_TIMEOUT_MS (2.5s), the watchdog forces close → reconnect →
  * primary_path_idx rotates (issue #46 mechanism), so a dead first-listed path
  * recovers in ~15s instead of waiting 120s for xquic's idle_time_out. */
 
@@ -1719,7 +1709,7 @@ extern int mqvpn_client_test_set_handshake_started_us(mqvpn_client_t *c, uint64_
 extern int mqvpn_client_test_handshake_stalled(const mqvpn_client_t *c, uint64_t now_us);
 extern int mqvpn_client_test_force_state(mqvpn_client_t *c, mqvpn_client_state_t s);
 
-#define STALL_THRESHOLD_US ((uint64_t)5 * 1000 * 1000)
+#define STALL_THRESHOLD_US ((uint64_t)2500 * 1000)
 
 TEST(handshake_stall_not_triggered_when_idle)
 {
@@ -1737,8 +1727,8 @@ TEST(handshake_stall_not_triggered_within_threshold)
     uint64_t started = 1000000; /* arbitrary, deterministic */
     ASSERT_EQ(mqvpn_client_test_set_handshake_started_us(c, started), 0);
 
-    /* now = started + 4s : below 5s threshold */
-    uint64_t now = started + 4 * 1000000;
+    /* now = started + 2s : below 2.5s threshold */
+    uint64_t now = started + 2 * 1000000;
     ASSERT_EQ(mqvpn_client_test_handshake_stalled(c, now), 0);
 
     mqvpn_client_destroy(c);
@@ -1752,8 +1742,8 @@ TEST(handshake_stall_triggered_after_threshold)
     uint64_t started = 1000000;
     ASSERT_EQ(mqvpn_client_test_set_handshake_started_us(c, started), 0);
 
-    /* now = started + 6s : exceeds 5s threshold */
-    uint64_t now = started + 6 * 1000000;
+    /* now = started + 3s : exceeds 2.5s threshold */
+    uint64_t now = started + 3 * 1000000;
     ASSERT_EQ(mqvpn_client_test_handshake_stalled(c, now), 1);
 
     mqvpn_client_destroy(c);
@@ -2255,10 +2245,10 @@ TEST(get_interest_includes_handshake_stall_deadline)
     i.struct_size = sizeof(i);
     ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
 
-    /* Watchdog fires no later than 5s from started_us. next_timer_ms must
+    /* Watchdog fires no later than 2.5s from started_us. next_timer_ms must
      * not exceed that, else the platform's libevent timer would not wake the
      * client to run the watchdog before idle_time_out (120s) takes over. */
-    ASSERT_EQ(i.next_timer_ms <= 5000, 1);
+    ASSERT_EQ(i.next_timer_ms <= 2500, 1);
 
     mqvpn_client_destroy(c);
 }
@@ -2277,7 +2267,7 @@ TEST(get_interest_includes_handshake_stall_deadline)
  * get_interest so the deadline-wake never needs a netns to verify.
  *
  * A fixed injected clock makes the arithmetic exact:
- * apply_path_activation_failure arms recreate_after_us = now + 5s
+ * apply_path_activation_failure arms recreate_after_us = now + 1s
  * (PATH_RECREATE_DELAY_US, the first-retry backoff). */
 static uint64_t g_recovery_fake_now_us = 0;
 static uint64_t
@@ -2308,8 +2298,8 @@ make_recovery_test_client(void)
 extern int mqvpn_client_test_force_established(mqvpn_client_t *c);
 extern int mqvpn_client_test_set_next_wake_us(mqvpn_client_t *c, uint64_t us);
 
-/* Case 1: CREATE_WAIT slot with recreate_after_us = now + 5s. The retry
- * deadline (5000 ms) must clamp next_timer_ms below the 30s xquic wake. */
+/* Case 1: CREATE_WAIT slot with recreate_after_us = now + 1s. The retry
+ * deadline (1000 ms) must clamp next_timer_ms below the 30s xquic wake. */
 TEST(get_interest_recovery_create_wait_future_clamps_wake)
 {
     g_recovery_fake_now_us = 1000000000ULL; /* arbitrary 1000 s base */
@@ -2317,7 +2307,7 @@ TEST(get_interest_recovery_create_wait_future_clamps_wake)
     mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
     ASSERT_NE(h, (mqvpn_path_handle_t)-1);
 
-    /* PENDING -> CREATE_WAIT, arming recreate_after_us = base + 5s. */
+    /* PENDING -> CREATE_WAIT, arming recreate_after_us = base + 1s. */
     ASSERT_EQ(mqvpn_client_apply_path_activation_failure(c, h, g_recovery_fake_now_us),
               0);
     ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
@@ -2328,9 +2318,9 @@ TEST(get_interest_recovery_create_wait_future_clamps_wake)
     ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
 
     ASSERT_EQ(i.next_timer_ms > 0, 1);
-    ASSERT_EQ(i.next_timer_ms <= 5000, 1);
-    /* Exact: clamped to the 5s deadline, not the 30s xquic wake. */
-    ASSERT_EQ(i.next_timer_ms, 5000);
+    ASSERT_EQ(i.next_timer_ms <= 1000, 1);
+    /* Exact: clamped to the 1s deadline, not the 30s xquic wake. */
+    ASSERT_EQ(i.next_timer_ms, 1000);
 
     mqvpn_client_destroy(c);
 }
@@ -2349,7 +2339,7 @@ TEST(get_interest_recovery_create_wait_past_forces_1ms)
     ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
     ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 30ULL * 1000000), 0);
 
-    /* Advance past the base+5s retry deadline. */
+    /* Advance past the base+1s retry deadline. */
     g_recovery_fake_now_us += 10ULL * 1000000;
 
     mqvpn_interest_t i = {0};
@@ -2362,7 +2352,7 @@ TEST(get_interest_recovery_create_wait_past_forces_1ms)
 
 /* Case 3: a fresh PENDING slot has recreate_after_us == 0, so the Recovery
  * block must contribute nothing — the xquic-requested wake passes through
- * untouched (NOT clamped to 5000, NOT forced to 1). Isolates the block by
+ * untouched (NOT clamped to 1000, NOT forced to 1). Isolates the block by
  * seeding next_wake_us to a distinctive 8000 ms. */
 TEST(get_interest_recovery_ignores_slot_without_retry_deadline)
 {
@@ -2401,7 +2391,7 @@ TEST(get_interest_recovery_inert_when_not_established)
     ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
     ASSERT_EQ(mqvpn_client_test_force_state(c, MQVPN_STATE_RECONNECTING), 0);
 
-    /* Deadline (base+5s) now in the past. */
+    /* Deadline (base+1s) now in the past. */
     g_recovery_fake_now_us += 10ULL * 1000000;
 
     mqvpn_interest_t i = {0};
@@ -2854,7 +2844,7 @@ main(void)
     run_activation_failure_first_retry_marks_create_wait();
     run_activation_failure_pins_create_wait_internal();
     run_activation_failure_invalid_handle_returns_error();
-    run_activation_failure_eventually_closes_path();
+    run_activation_failure_remains_recoverable();
     run_cb_path_removed_validating_to_create_wait();
     run_remove_live_primary_emits_abandon();
 
