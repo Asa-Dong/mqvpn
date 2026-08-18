@@ -2667,19 +2667,16 @@ TEST(reactivate_slot_eligible_create_wait)
     mqvpn_client_destroy(c);
 }
 
-TEST(reactivate_slot_eligible_rejects_validating)
+TEST(reactivate_slot_eligible_accepts_pending)
 {
-    /* The complement: a slot that's still in VALIDATING (xquic_path_live==1,
-     * waiting on async PATH_CHALLENGE validation) must NOT be eligible —
-     * reactivating it would burn a fresh xqc path_id while the existing one
-     * is still alive. */
     mqvpn_client_t *c = make_test_client();
     mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
     ASSERT_NE(h, (mqvpn_path_handle_t)-1);
 
-    /* PENDING (freshly added) is also rejected: the cb_ready_to_create_path
-     * drain owns first activation. */
-    ASSERT_EQ(mqvpn_client_test_reactivate_slot_eligible(c, h), MQVPN_ERR_INVALID_STATE);
+    /* PENDING is eligible: an interface may receive DHCP only after xquic's
+     * initial ready-to-create-path callback, and RTM_NEWADDR must activate
+     * this fixed slot without allocating another one. */
+    ASSERT_EQ(mqvpn_client_test_reactivate_slot_eligible(c, h), MQVPN_OK);
 
     mqvpn_client_destroy(c);
 }
@@ -2932,7 +2929,7 @@ main(void)
     run_reactivate_path_null_client();
     run_reactivate_path_not_established();
     run_reactivate_slot_eligible_create_wait();
-    run_reactivate_slot_eligible_rejects_validating();
+    run_reactivate_slot_eligible_accepts_pending();
     run_add_path_fd_with_outcome_null_outcome_acts_as_alias();
     run_add_path_fd_with_outcome_defers_to_ok_when_multipath_not_ready();
     run_add_path_fd_with_outcome_invalid_args_return_minus_one();

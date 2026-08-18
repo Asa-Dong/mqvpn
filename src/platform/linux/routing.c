@@ -36,11 +36,10 @@ run_ip_cmd(const char *const argv[])
 }
 
 static int
-discover_route(const char *server_ip, sa_family_t af, char *gateway, size_t gw_len,
-               char *iface, size_t if_len)
+run_ip_capture(const char *const argv[], char *out, size_t out_len)
 {
     int fds[2];
-    if (pipe(fds) < 0) return -1;
+    if (out_len == 0 || pipe(fds) < 0) return -1;
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -50,26 +49,29 @@ discover_route(const char *server_ip, sa_family_t af, char *gateway, size_t gw_l
     }
 
     if (pid == 0) {
-        const char *const a4[] = {"ip", "-4", "route", "get", server_ip, NULL};
-        const char *const a6[] = {"ip", "-6", "route", "get", server_ip, NULL};
         close(fds[0]);
         if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(127);
         close(fds[1]);
-        execvp("ip", (char *const *)((af == AF_INET6) ? a6 : a4));
+        execvp("ip", (char *const *)argv);
         _exit(127);
     }
 
     close(fds[1]);
-    char out[1024];
-    ssize_t nread = read(fds[0], out, sizeof(out) - 1);
+    ssize_t nread = read(fds[0], out, out_len - 1);
     close(fds[0]);
 
     int status = 0;
     while (waitpid(pid, &status, 0) < 0)
         if (errno != EINTR) return -1;
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || nread <= 0) return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || nread < 0) return -1;
 
     out[nread] = '\0';
+    return 0;
+}
+
+static int
+parse_route_output(char *out, char *gateway, size_t gw_len, char *iface, size_t if_len)
+{
     gateway[0] = '\0';
     iface[0] = '\0';
 
@@ -87,6 +89,89 @@ discover_route(const char *server_ip, sa_family_t af, char *gateway, size_t gw_l
     return iface[0] ? 0 : -1;
 }
 
+static int
+discover_route(const char *server_ip, sa_family_t af, char *gateway, size_t gw_len,
+               char *iface, size_t if_len)
+{
+    const char *const a4[] = {"ip", "-4", "route", "get", server_ip, NULL};
+    const char *const a6[] = {"ip", "-6", "route", "get", server_ip, NULL};
+    char out[1024];
+    if (run_ip_capture((af == AF_INET6) ? a6 : a4, out, sizeof(out)) < 0) return -1;
+    return parse_route_output(out, gateway, gw_len, iface, if_len);
+}
+
+/* Split-default routes make `ip route get <server>` point at the TUN after
+ * setup. To repair a pin after DHCP/netifd has replaced an uplink, discover
+ * the physical default directly instead of consulting that redirected lookup. */
+static int
+discover_default_route(sa_family_t af, char *gateway, size_t gw_len, char *iface,
+                       size_t if_len)
+{
+    const char *const a4[] = {"ip", "-4", "route", "show", "default", NULL};
+    const char *const a6[] = {"ip", "-6", "route", "show", "default", NULL};
+    char out[1024];
+    if (run_ip_capture((af == AF_INET6) ? a6 : a4, out, sizeof(out)) < 0) return -1;
+    return parse_route_output(out, gateway, gw_len, iface, if_len);
+}
+
+static int
+server_pin_matches(const char *host_cidr, sa_family_t af, const char *gateway,
+                   const char *iface)
+{
+    const char *const a4[] = {"ip", "-4", "route", "show", "exact", host_cidr, NULL};
+    const char *const a6[] = {"ip", "-6", "route", "show", "exact", host_cidr, NULL};
+    char out[1024], current_gateway[INET6_ADDRSTRLEN], current_iface[IFNAMSIZ];
+    if (run_ip_capture((af == AF_INET6) ? a6 : a4, out, sizeof(out)) < 0) return 0;
+    if (parse_route_output(out, current_gateway, sizeof(current_gateway), current_iface,
+                           sizeof(current_iface)) < 0)
+        return 0;
+    return strcmp(current_gateway, gateway) == 0 && strcmp(current_iface, iface) == 0;
+}
+
+/* Best-effort repair for a server pin flushed by DHCP/netifd after an uplink
+ * handover. The caller keeps the tunnel alive on failure: marked MQVPN
+ * sockets still use the physical main-table route, and a later event/timer
+ * retries once a default route is available. */
+int
+refresh_server_route(platform_ctx_t *p)
+{
+    if (!p->routing_configured) return 0;
+
+    sa_family_t af = p->server_addr.ss_family;
+    const char *ip_flag = (af == AF_INET6) ? "-6" : "-4";
+    int prefix = mqvpn_sa_host_prefix(&p->server_addr);
+    char host_cidr[INET6_ADDRSTRLEN + 5];
+    char gateway[INET6_ADDRSTRLEN], iface[IFNAMSIZ];
+    snprintf(host_cidr, sizeof(host_cidr), "%s/%d", p->server_ip_str, prefix);
+
+    if (discover_default_route(af, gateway, sizeof(gateway), iface, sizeof(iface)) < 0 ||
+        iface[0] == '\0' || strcmp(iface, p->tun.name) == 0)
+        return -1;
+    if (server_pin_matches(host_cidr, af, gateway, iface)) {
+        snprintf(p->orig_gateway, sizeof(p->orig_gateway), "%s", gateway);
+        snprintf(p->orig_iface, sizeof(p->orig_iface), "%s", iface);
+        return 0;
+    }
+
+    int rc;
+    if (gateway[0]) {
+        const char *const pin[] = {"ip", ip_flag, "route", "replace", host_cidr, "via",
+                                   gateway, "dev", iface, NULL};
+        rc = run_ip_cmd(pin);
+    } else {
+        const char *const pin[] = {"ip", ip_flag, "route", "replace", host_cidr,
+                                   "dev", iface, NULL};
+        rc = run_ip_cmd(pin);
+    }
+    if (rc < 0) return -1;
+
+    snprintf(p->orig_gateway, sizeof(p->orig_gateway), "%s", gateway);
+    snprintf(p->orig_iface, sizeof(p->orig_iface), "%s", iface);
+    LOG_INF("split tunnel: refreshed server pin %s via %s dev %s", p->server_ip_str,
+            gateway[0] ? gateway : "on-link", iface);
+    return 0;
+}
+
 int
 setup_routes(platform_ctx_t *p)
 {
@@ -94,15 +179,21 @@ setup_routes(platform_ctx_t *p)
     int prefix = mqvpn_sa_host_prefix(&p->server_addr);
     mqvpn_sa_ntop(&p->server_addr, p->server_ip_str, sizeof(p->server_ip_str));
 
-    if (discover_route(p->server_ip_str, af, p->orig_gateway, sizeof(p->orig_gateway),
-                       p->orig_iface, sizeof(p->orig_iface)) < 0) {
-        LOG_WRN("could not determine original iface for %s", p->server_ip_str);
-        return -1;
-    }
-
     char host_cidr[INET6_ADDRSTRLEN + 5];
     snprintf(host_cidr, sizeof(host_cidr), "%s/%d", p->server_ip_str, prefix);
     const char *ip_flag = (af == AF_INET6) ? "-6" : "-4";
+
+    if (discover_route(p->server_ip_str, af, p->orig_gateway, sizeof(p->orig_gateway),
+                       p->orig_iface, sizeof(p->orig_iface)) < 0) {
+        LOG_ERR("cannot determine an underlay route to server %s; refusing split tunnel",
+                p->server_ip_str);
+        return -1;
+    }
+    if (p->orig_iface[0] == '\0' || strcmp(p->orig_iface, p->tun.name) == 0) {
+        LOG_ERR("cannot determine an underlay route to server %s; refusing split tunnel",
+                p->server_ip_str);
+        return -1;
+    }
 
     if (p->orig_gateway[0] != '\0') {
         LOG_INF("split tunnel: server %s via %s dev %s", p->server_ip_str,
@@ -111,12 +202,20 @@ setup_routes(platform_ctx_t *p)
                                    host_cidr,     "via",   p->orig_gateway, "dev",
                                    p->orig_iface, NULL};
         if (run_ip_cmd(pin) < 0) {
-            LOG_WRN("failed to pin server route");
+            LOG_ERR("failed to pin server %s via %s; refusing split tunnel",
+                    p->server_ip_str, p->orig_iface);
             return -1;
         }
     } else {
         LOG_INF("split tunnel: server %s on-link dev %s", p->server_ip_str,
                 p->orig_iface);
+        const char *const pin[] = {"ip", ip_flag, "route", "replace", host_cidr,
+                                   "dev", p->orig_iface, NULL};
+        if (run_ip_cmd(pin) < 0) {
+            LOG_ERR("failed to pin on-link server %s via %s; refusing split tunnel",
+                    p->server_ip_str, p->orig_iface);
+            return -1;
+        }
     }
 
     const char *const low[] = {"ip",  "route",     "replace", "0.0.0.0/1",
@@ -134,10 +233,18 @@ setup_routes(platform_ctx_t *p)
             const char *u3[] = {"ip",  ip_flag,         "route", "del",         host_cidr,
                                 "via", p->orig_gateway, "dev",   p->orig_iface, NULL};
             (void)run_ip_cmd(u3);
+        } else {
+            const char *u3[] = {"ip", ip_flag, "route", "del", host_cidr,
+                                "dev", p->orig_iface, NULL};
+            (void)run_ip_cmd(u3);
         }
         return -1;
     }
     p->routing_configured = 1;
+
+    /* Policy routing bypass for MQVPN marked traffic (Fwmark 0x51 -> table main) */
+    const char *const r_add[] = {"ip", "rule", "add", "fwmark", "0x51", "table", "main", "priority", "100", NULL};
+    (void)run_ip_cmd(r_add);
 
     /* IPv6 catch-all routes */
     if (p->has_v6) {
@@ -160,6 +267,9 @@ cleanup_routes(platform_ctx_t *p)
 {
     if (!p->routing_configured) return;
 
+    const char *const r_del[] = {"ip", "rule", "del", "fwmark", "0x51", "table", "main", "priority", "100", NULL};
+    (void)run_ip_cmd(r_del);
+
     if (p->routing6_configured) {
         const char *d1[] = {"ip", "-6", "route", "del", "::/1", "dev", p->tun.name, NULL};
         const char *d2[] = {"ip",       "-6",  "route",     "del",
@@ -174,15 +284,21 @@ cleanup_routes(platform_ctx_t *p)
     (void)run_ip_cmd(d3);
     (void)run_ip_cmd(d4);
 
-    if (p->orig_gateway[0]) {
+    if (p->orig_iface[0]) {
         const char *fl = (p->server_addr.ss_family == AF_INET6) ? "-6" : "-4";
         int pfx = mqvpn_sa_host_prefix(&p->server_addr);
         char hc[INET6_ADDRSTRLEN + 5];
         snprintf(hc, sizeof(hc), "%s/%d", p->server_ip_str, pfx);
-        const char *d5[] = {
-            "ip",          fl,  "route", "del", hc, "via", p->orig_gateway, "dev",
-            p->orig_iface, NULL};
-        (void)run_ip_cmd(d5);
+        if (p->orig_gateway[0]) {
+            const char *d5[] = {
+                "ip",          fl,  "route", "del", hc, "via", p->orig_gateway, "dev",
+                p->orig_iface, NULL};
+            (void)run_ip_cmd(d5);
+        } else {
+            const char *d5[] = {"ip", fl, "route", "del", hc, "dev", p->orig_iface,
+                                NULL};
+            (void)run_ip_cmd(d5);
+        }
     }
     p->routing_configured = 0;
     LOG_INF("split tunnel routes cleaned up");

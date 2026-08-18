@@ -39,6 +39,8 @@
 #endif
 #ifndef _WIN32
 #  include <errno.h>
+#  include <sys/ioctl.h>
+#  include <net/if.h>
 #endif
 #include <inttypes.h>
 #include <time.h>
@@ -131,6 +133,7 @@ struct cli_conn_s {
     uint64_t masque_stream_id;
     int tunnel_ok;
     int tunnel_notified; /* one-shot: a tunnel_closed already fired for this conn */
+    int close_requested; /* xquic close queued; callback remains the sole owner */
     int addr_assigned;
     uint8_t assigned_ip[4];
     uint8_t assigned_prefix;
@@ -282,6 +285,9 @@ struct mqvpn_client_s {
      * (typically a dead primary path) before xquic's 120s idle_time_out. */
     uint64_t handshake_started_us;
 
+    /* Timestamp when all paths became dead in ESTABLISHED state */
+    uint64_t all_paths_dead_since_us;
+
     /* ICMP PTB rate limit */
     mqvpn_ptb_bucket_t ptb_bucket;
 
@@ -300,7 +306,7 @@ struct mqvpn_client_s {
 
 static const uint8_t state_transitions[MQVPN_STATE__COUNT][MQVPN_STATE__COUNT] = {
     /*                    IDLE CONN AUTH TREADY EST  RECON CLOSE */
-    /* IDLE           */ {0, 1, 0, 0, 0, 0, 0},
+    /* IDLE           */ {0, 1, 0, 0, 0, 1, 0},
     /* CONNECTING     */ {0, 0, 1, 0, 0, 1, 1},
     /* AUTHENTICATING */ {0, 0, 0, 1, 0, 1, 1},
     /* TUNNEL_READY   */ {0, 0, 0, 0, 1, 0, 1},
@@ -644,15 +650,47 @@ get_fd_for_path(mqvpn_client_t *c, uint64_t xqc_path_id)
     return p ? p->fd : -1;
 }
 
+static int
+path_iface_has_ip(const char *ifname)
+{
+#ifndef _WIN32
+    if (!ifname || !ifname[0]) return 1;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+    int ok = (ioctl(fd, SIOCGIFADDR, &ifr) == 0);
+    close(fd);
+    return ok;
+#else
+    return 1;
+#endif
+}
+
 /* Pick the next active path index for the next handshake attempt.
- * Skips paths that the platform has marked inactive or the library has
- * already closed. Returns the input index if no other candidate exists. */
+ * Skips paths that the platform has marked inactive, the library has
+ * already closed, or whose interface does NOT have a valid IP address.
+ * Priority 1: Pick a candidate with an active IP address.
+ * Priority 2: Fallback to any attached candidate. */
 static int
 client_next_primary_idx(const mqvpn_client_t *c, int from_idx)
 {
     if (c->n_paths <= 0) return 0;
     int start = (from_idx + 1) % c->n_paths;
+
+    /* 1. First pass: look for a path with confirmed IP address */
     int i = start;
+    do {
+        const path_entry_t *p = &c->paths[i];
+        if (p->platform_attached && p->status != MQVPN_PATH_CLOSED && path_iface_has_ip(p->name)) {
+            return i;
+        }
+        i = (i + 1) % c->n_paths;
+    } while (i != start);
+
+    /* 2. Fallback pass: any attached path */
+    i = start;
     do {
         const path_entry_t *p = &c->paths[i];
         if (p->platform_attached && p->status != MQVPN_PATH_CLOSED) return i;
@@ -1314,6 +1352,39 @@ cli_notify_conn_closed(mqvpn_client_t *c, cli_conn_t *conn)
 {
     if (c->cbs.tunnel_closed && !conn->tunnel_notified)
         c->cbs.tunnel_closed(MQVPN_ERR_CLOSED, c->user_ctx);
+}
+
+static void
+client_force_reconnect(mqvpn_client_t *c, const char *reason)
+{
+    LOG_W(c, "force reconnect triggered: %s", reason);
+    if (c->conn) {
+        if (!c->engine) {
+            LOG_E(c, "force reconnect ignored: live connection has no xquic engine");
+            return;
+        }
+        if (c->conn->close_requested) return;
+
+        /* xqc_h3_conn_close is asynchronous. cb_h3_conn_close owns the
+         * notification, destruction, and reconnect timer just as it does for
+         * every other connection close. Destroying here races that callback. */
+        c->conn->close_requested = 1;
+        xqc_h3_conn_close(c->engine, &c->conn->cid);
+        return;
+    }
+
+    /* No connection object exists, so there can be no close callback to arm
+     * the retry timer (for example, an earlier underlay wait). */
+    if (!c->shutting_down && c->config.reconnect_enable) {
+        int delay = client_arm_reconnect_timer(c);
+        LOG_I(c, "reconnecting in %d seconds (attempt %d)...", delay,
+              c->reconnect_attempts);
+        client_set_state(c, MQVPN_STATE_RECONNECTING);
+        if (c->cbs.reconnect_scheduled) c->cbs.reconnect_scheduled(delay, c->user_ctx);
+        return;
+    }
+
+    client_set_state(c, MQVPN_STATE_CLOSED);
 }
 
 static int
@@ -2384,6 +2455,10 @@ static void
 client_activate_path(mqvpn_client_t *c, path_entry_t *p, int idx)
 {
     if (p->xquic_path_live) return;
+    if (!path_iface_has_ip(p->name)) {
+        LOG_D(c, "path[%d %s] has no IP address, skipping activation", idx, p->name);
+        return;
+    }
 
     uint64_t new_id = 0;
     activate_result_t r = activate_via_xquic_classify(c, &new_id);
@@ -2687,13 +2762,20 @@ cli_start_connection(mqvpn_client_t *c)
 
     int multipath = c->config.multipath ? 1 : 0;
 
-    /* Guard: primary path must be platform-attached before we create the
-     * xquic connection (avoids leaking an xquic conn on early bail-out). */
+    /* Smart candidate selection: prioritize paths with valid IPv4 addresses */
+    if (c->n_paths > 0) {
+        c->primary_path_idx = client_next_primary_idx(c, (c->primary_path_idx + c->n_paths - 1) % c->n_paths);
+    }
+
+    /* Guard: primary path must be usable before we create the xquic
+     * connection. In the R4S DHCP topology an attached VLAN may exist long
+     * before it has an address; waiting here avoids creating a CID that cannot
+     * leave the router. */
     if (c->n_paths > 0 && c->primary_path_idx < c->n_paths) {
         path_entry_t *pp = &c->paths[c->primary_path_idx];
-        if (!pp->platform_attached || pp->fd < 0) {
-            LOG_W(c, "primary path[%s] not ready (attached=%d fd=%d state=%s)", pp->name,
-                  pp->platform_attached, pp->fd, path_lifecycle_name(pp->state));
+        if (!pp->platform_attached || pp->fd < 0 || !path_iface_has_ip(pp->name)) {
+            LOG_I(c, "primary path[%s] waiting for usable IPv4 (attached=%d fd=%d state=%s)",
+                  pp->name, pp->platform_attached, pp->fd, path_lifecycle_name(pp->state));
             goto cleanup;
         }
     }
@@ -3060,7 +3142,17 @@ mqvpn_client_connect(mqvpn_client_t *c)
     }
 #endif
 
-    if (cli_start_connection(c) < 0) return MQVPN_ERR_ENGINE;
+    if (cli_start_connection(c) < 0) {
+        if (!c->config.reconnect_enable) return MQVPN_ERR_ENGINE;
+
+        int delay = client_arm_reconnect_timer(c);
+        LOG_I(c, "no usable underlay path; retrying in %ds (attempt %d)", delay,
+              c->reconnect_attempts);
+        client_set_state(c, MQVPN_STATE_RECONNECTING);
+        if (c->cbs.reconnect_scheduled)
+            c->cbs.reconnect_scheduled(delay, c->user_ctx);
+        return MQVPN_OK;
+    }
 
     client_set_state(c, MQVPN_STATE_CONNECTING);
     /* Platform drives the engine via tick() — no main_logic here */
@@ -3324,12 +3416,12 @@ mqvpn_client_on_platform_fd_closed(mqvpn_client_t *c, mqvpn_path_handle_t handle
 
 /* ─── Path re-activation (platform-triggered) ─── */
 
-/* Per-slot eligibility for platform-driven reactivation. Returns MQVPN_OK
- * if the slot is in a state where the next action would be a retry — i.e.
- * xquic-side dead and waiting (DEGRADED, CREATE_WAIT) or fully closed but
- * platform-restorable (CLOSED_RECOVERABLE). VALIDATING is excluded by the
- * xquic_path_live==1 check; PENDING (never tried) is excluded so the normal
- * cb_ready_to_create_path drain remains authoritative on first activation.
+/* Per-slot eligibility for platform-driven activation or reactivation.
+ * A PENDING slot is eligible too: it may have skipped its first activation
+ * because the configured interface had no DHCP address when xquic announced
+ * readiness. RTM_NEWADDR must be able to activate that same fixed slot later
+ * without allocating another path. VALIDATING is excluded by the
+ * xquic_path_live==1 check.
  *
  * CREATE_WAIT was added by PR3 as the post-VALIDATING-fail state; before
  * that split the same slot would have been in DEGRADED. */
@@ -3338,8 +3430,8 @@ reactivate_slot_eligible(const path_entry_t *p)
 {
     if (p->xquic_path_live) return MQVPN_ERR_INVALID_STATE;
     if (!p->platform_attached) return MQVPN_ERR_INVALID_STATE;
-    if (p->state != PATH_LC_DEGRADED && p->state != PATH_LC_CREATE_WAIT &&
-        p->state != PATH_LC_CLOSED_RECOVERABLE)
+    if (p->state != PATH_LC_PENDING && p->state != PATH_LC_DEGRADED &&
+        p->state != PATH_LC_CREATE_WAIT && p->state != PATH_LC_CLOSED_RECOVERABLE)
         return MQVPN_ERR_INVALID_STATE;
     return MQVPN_OK;
 }
@@ -3357,9 +3449,8 @@ mqvpn_client_reactivate_path(mqvpn_client_t *c, mqvpn_path_handle_t handle)
     path_entry_t *p = find_path_by_handle(c, handle);
     if (!p) return MQVPN_ERR_INVALID_ARG;
 
-    /* Per-slot eligibility: DEGRADED / CREATE_WAIT / CLOSED_RECOVERABLE only.
-     * Entry gate (live regression follow-up — main 433272f). Defense in depth
-     * with path_on_manual_reactivate's own 3-state check. */
+    /* Per-slot eligibility includes PENDING for an interface that acquired
+     * its address after the initial ready-to-create-path callback. */
     int gate = reactivate_slot_eligible(p);
     if (gate != MQVPN_OK) return gate;
 
@@ -3373,10 +3464,12 @@ mqvpn_client_reactivate_path(mqvpn_client_t *c, mqvpn_path_handle_t handle)
         .new_xqc_path_id = new_id,
         .now_us = client_now_us(c),
     };
-    path_on_event(c, p, PATH_EVENT_MANUAL_REACTIVATE, &ctx);
+    path_on_event(c, p,
+                  p->state == PATH_LC_PENDING ? PATH_EVENT_ACTIVATE_REQUESTED
+                                               : PATH_EVENT_MANUAL_REACTIVATE,
+                  &ctx);
 
-    /* path_on_event(MANUAL_REACTIVATE) lands the slot in VALIDATING on OK,
-     * or leaves state unchanged on TRANSIENT/PERMANENT. */
+    /* Either activation event lands the slot in VALIDATING on success. */
     if (p->state != PATH_LC_VALIDATING) return MQVPN_ERR_ENGINE;
     return MQVPN_OK;
 }
@@ -3791,6 +3884,12 @@ tick_drive_retry_timer(mqvpn_client_t *c, path_entry_t *p, int idx, uint64_t now
     if (p->state != PATH_LC_DEGRADED && p->state != PATH_LC_CREATE_WAIT) return;
     if (p->recreate_after_us == 0 || now < p->recreate_after_us) return;
 
+    if (!path_iface_has_ip(p->name)) {
+        /* No IP on interface: defer retry without burning xquic CID */
+        p->recreate_after_us = now + 3ULL * 1000000;
+        return;
+    }
+
     uint64_t new_id = 0;
     activate_result_t r = activate_via_xquic_classify(c, &new_id);
     LOG_I(c, "path[%d] retry: result=%s retries=%d/%d", idx,
@@ -3881,11 +3980,26 @@ tick_path_recovery(mqvpn_client_t *c)
 
     uint64_t now = client_now_us(c);
     tick_check_all_validations(c, now);
+    int active_or_validating = 0;
     for (int i = 0; i < c->n_paths; i++) {
         path_entry_t *p = &c->paths[i];
         client_path_residence_check(c, p, now);
         tick_drive_retry_timer(c, p, i, now);
         path_fsm_tick_confirm_stable(c, p, now);
+        if (p->state == PATH_LC_ACTIVE || p->state == PATH_LC_VALIDATING || p->state == PATH_LC_STANDBY) {
+            active_or_validating++;
+        }
+    }
+
+    if (active_or_validating == 0) {
+        if (c->all_paths_dead_since_us == 0) {
+            c->all_paths_dead_since_us = now;
+        } else if (now - c->all_paths_dead_since_us > 3ULL * 1000000) {
+            c->all_paths_dead_since_us = 0;
+            client_force_reconnect(c, "all paths dead for >3s");
+        }
+    } else {
+        c->all_paths_dead_since_us = 0;
     }
 }
 

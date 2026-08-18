@@ -113,6 +113,7 @@ void schedule_next_tick(platform_ctx_t *p);
 /* routing.c */
 int setup_routes(platform_ctx_t *p);
 void cleanup_routes(platform_ctx_t *p);
+int refresh_server_route(platform_ctx_t *p);
 
 /* darwin/routing.c — `route -n get` output parser, non-static for unit tests.
  * Fills gateway (empty string if on-link, incl. "link#N" gateways) and iface.

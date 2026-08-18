@@ -50,6 +50,10 @@ mqvpn_path_mgr_add(mqvpn_path_mgr_t *mgr, const char *iface,
     int bufsize = 1 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *)&bufsize, sizeof(bufsize));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsize, sizeof(bufsize));
+#if defined(__linux__) && defined(SO_MARK)
+    uint32_t fwmark = 0x51; /* 81 - WireGuard-style socket mark for anti-blackhole policy routing */
+    setsockopt(fd, SOL_SOCKET, SO_MARK, &fwmark, sizeof(fwmark));
+#endif
 #ifdef _WIN32
     {
         int actual_snd = 0, actual_rcv = 0;
