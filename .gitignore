@@ -57,3 +57,8 @@ website/public/perf-data/
 # local-only bench notes (kept untracked by owner decision)
 docs/report/2026-07-03-hybrid-h2a-microbench.md
 docs/report/2026-07-04-hybrid-h2b-throughput.md
+
+
+build_arm64/
+build_x86_64/
+third_party/

@@ -101,7 +101,7 @@ discover_route(const char *server_ip, sa_family_t af, char *gateway, size_t gw_l
 }
 
 /* Split-default routes make `ip route get <server>` point at the TUN after
- * setup. To repair a pin after DHCP/netifd has replaced an uplink, discover
+ * setup.  To repair a pin after DHCP/netifd has replaced an uplink, discover
  * the physical default directly instead of consulting that redirected lookup. */
 static int
 discover_default_route(sa_family_t af, char *gateway, size_t gw_len, char *iface,
@@ -129,7 +129,7 @@ server_pin_matches(const char *host_cidr, sa_family_t af, const char *gateway,
 }
 
 /* Best-effort repair for a server pin flushed by DHCP/netifd after an uplink
- * handover. The caller keeps the tunnel alive on failure: marked MQVPN
+ * handover.  The caller keeps the tunnel alive on failure: marked MQVPN
  * sockets still use the physical main-table route, and a later event/timer
  * retries once a default route is available. */
 int
