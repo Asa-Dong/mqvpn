@@ -709,6 +709,7 @@ add_executable(mqvpn
     src/platform/linux/netlink_mon.c
     src/platform/linux/route_check.c
     src/platform/linux/control_socket.c
+    src/platform/linux/client_status_socket.c
     src/platform/posix/status.c
     src/platform/linux/routing.c
     src/platform/linux/killswitch.c

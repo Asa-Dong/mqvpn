@@ -20,6 +20,9 @@
  */
 int linux_platform_run_client(const mqvpn_client_cfg_t *cfg);
 
+/* Query the root-local client status socket and print one JSON response. */
+int linux_platform_client_status(void);
+
 /*
  * Run the VPN server using the libmqvpn API + Linux platform layer.
  * Blocks until shutdown (SIGINT/SIGTERM). Returns 0 on clean exit.

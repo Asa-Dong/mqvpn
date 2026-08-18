@@ -15,6 +15,7 @@
 
 #include "platform_internal.h"
 #include "platform_linux.h"
+#include "client_status_socket.h"
 #include "control_socket.h"
 #include "log.h"
 #include "mqvpn_internal.h" /* mqvpn_config_apply_reorder (INI reorder bridge) */
@@ -638,6 +639,10 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
         goto cleanup;
     }
 
+    /* Observability only: a failed local status socket must not interrupt
+     * VPN setup or path recovery. */
+    ctx.client_status_socket = client_status_socket_create(ctx.eb, ctx.client);
+
     /* Create UDP sockets */
     mqvpn_path_mgr_init(&ctx.path_mgr);
     if (cfg->n_paths > 0) {
@@ -730,6 +735,10 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
     rc = 0;
 
 cleanup:
+    /* Stop the query callback before client destruction below. */
+    client_status_socket_destroy(ctx.client_status_socket);
+    ctx.client_status_socket = NULL;
+
     /* Receive-side offload summary (counters documented in platform_ctx_t).
      * Emitted on every teardown path — including gro_config=0 — so the bench
      * and e2e can parse one stable line per run regardless of configuration.
@@ -810,6 +819,12 @@ cleanup:
     if (ctx.eb) event_base_free(ctx.eb);
 
     return rc;
+}
+
+int
+linux_platform_client_status(void)
+{
+    return client_status_socket_query();
 }
 
 /* ================================================================

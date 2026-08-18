@@ -71,6 +71,7 @@ usage(const char *prog)
         "  --status                  Query server status via control API and exit\n"
         "                            (uses --control-port, or [Control] Listen from "
         "--config)\n"
+        "  --client-status           Query local Linux client path status as JSON and exit\n"
         "  --cc bbr2|bbr|cubic|none  Congestion control algorithm (default bbr2)\n"
         "  --scheduler minrtt|wlb|wlb_udp_pin|backup_fec\n"
         "                            Multipath scheduler (default wlb)\n"
@@ -167,6 +168,7 @@ main(int argc, char *argv[])
         {"control-port", required_argument, NULL, 'X'},
         {"control-addr", required_argument, NULL, 'x'},
         {"status", no_argument, NULL, 'T'},
+        {"client-status", no_argument, NULL, 0x105},
         {"version", no_argument, NULL, 'V'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
@@ -206,6 +208,7 @@ main(int argc, char *argv[])
     int control_port_set = 0; /* 1 iff --control-port was passed explicitly */
     const char *control_addr = NULL;
     int status_mode = 0;
+    int client_status_mode = 0;
 
     int opt;
     while ((opt = getopt_long(argc, argv, "C:m:s:l:n:6:t:c:k:ia:u:Gp:d:S:M:L:X:x:Vh",
@@ -314,6 +317,7 @@ main(int argc, char *argv[])
             break;
         case 'x': control_addr = optarg; break;
         case 'T': status_mode = 1; break;
+        case 0x105: client_status_mode = 1; break;
         case 'L': log_level_str = optarg; break;
         case 'V': printf("mqvpn %s\n", mqvpn_version_string()); return 0;
         case 'h': usage(argv[0]); return 0;
@@ -325,6 +329,15 @@ main(int argc, char *argv[])
     if (genkey) {
         return mqvpn_auth_genkey() < 0 ? 1 : 0;
     }
+
+#if defined(__linux__)
+    if (client_status_mode) return linux_platform_client_status();
+#else
+    if (client_status_mode) {
+        fprintf(stderr, "error: --client-status is currently supported on Linux only\n");
+        return 1;
+    }
+#endif
 
     /* Load config file (if given), then apply CLI overrides.
      * Hoisted above --status so [Control] Listen in the INI/JSON config

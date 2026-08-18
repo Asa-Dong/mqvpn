@@ -22,6 +22,8 @@
 
 #include <event2/event.h>
 
+struct client_status_socket_s;
+
 typedef struct {
     mqvpn_client_t *client;
 
@@ -33,6 +35,9 @@ typedef struct {
     struct event *ev_sigterm;
     struct event *ev_status;  /* periodic status log timer */
     struct event *ev_recover; /* periodic dropped-path re-add timer (3s) */
+#if defined(__linux__)
+    struct client_status_socket_s *client_status_socket; /* root-local UDS query API */
+#endif
 
     /* Path manager (UDP sockets) */
     mqvpn_path_mgr_t path_mgr;
