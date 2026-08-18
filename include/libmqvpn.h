@@ -655,6 +655,13 @@ MQVPN_API void mqvpn_client_destroy(mqvpn_client_t *client);
 MQVPN_API int mqvpn_client_connect(mqvpn_client_t *client);
 MQVPN_API int mqvpn_client_disconnect(mqvpn_client_t *client);
 
+/* Request an in-process reconnect without marking the client as shut down.
+ * This is intended for transient platform failures (for example, a route
+ * table being rebuilt while a TUN is configured). The normal reconnect
+ * interval/backoff configuration applies. Must be called on the tick thread.
+ */
+MQVPN_API int mqvpn_client_reconnect(mqvpn_client_t *client);
+
 MQVPN_API mqvpn_path_handle_t mqvpn_client_add_path_fd(mqvpn_client_t *client, int fd,
                                                        const mqvpn_path_desc_t *desc);
 

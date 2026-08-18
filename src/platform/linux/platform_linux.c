@@ -196,7 +196,13 @@ fail:
     if (p->tun.fd >= 0) mqvpn_tun_destroy(&p->tun);
     p->tun.fd = -1;
     p->tun_up = 0;
-    mqvpn_client_disconnect(p->client);
+    /* A DHCP/netifd handover can briefly leave no main-table default route
+     * precisely while the replacement MQVPN connection reaches TUN_READY.
+     * This is transient: keep the process alive and let its normal reconnect
+     * timer retry after the physical underlay has settled. */
+    LOG_WRN("tunnel platform setup failed; requesting in-process reconnect");
+    if (mqvpn_client_reconnect(p->client) != MQVPN_OK)
+        LOG_ERR("failed to schedule reconnect after tunnel platform setup failure");
 }
 
 static void

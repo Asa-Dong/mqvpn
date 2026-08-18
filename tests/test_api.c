@@ -816,6 +816,19 @@ TEST(client_disconnect_from_idle)
     mqvpn_client_destroy(c);
 }
 
+TEST(client_reconnect_schedules_retry_without_shutdown)
+{
+    mqvpn_client_t *c = make_test_client();
+    extern int mqvpn_client_test_force_state(mqvpn_client_t *c, mqvpn_client_state_t s);
+    /* Exercise the no-live-connection branch: the caller has a transient
+     * platform failure while an attempted connection is being replaced. */
+    ASSERT_EQ(mqvpn_client_test_force_state(c, MQVPN_STATE_CONNECTING), 0);
+    ASSERT_EQ(mqvpn_client_get_state(c), MQVPN_STATE_CONNECTING);
+    ASSERT_EQ(mqvpn_client_reconnect(c), MQVPN_OK);
+    ASSERT_EQ(mqvpn_client_get_state(c), MQVPN_STATE_RECONNECTING);
+    mqvpn_client_destroy(c);
+}
+
 TEST(client_tick_null_safety)
 {
     ASSERT_EQ(mqvpn_client_tick(NULL), MQVPN_ERR_INVALID_ARG);
@@ -2800,6 +2813,7 @@ main(void)
     run_client_connect_from_invalid_state();
     run_client_disconnect_from_connecting();
     run_client_disconnect_from_idle();
+    run_client_reconnect_schedules_retry_without_shutdown();
     run_client_tick_null_safety();
     run_client_tick_ok();
 

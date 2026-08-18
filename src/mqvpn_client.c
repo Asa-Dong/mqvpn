@@ -3198,6 +3198,19 @@ mqvpn_client_disconnect(mqvpn_client_t *c)
     return MQVPN_OK;
 }
 
+int
+mqvpn_client_reconnect(mqvpn_client_t *c)
+{
+    if (!c) return MQVPN_ERR_INVALID_ARG;
+    ASSERT_TICK_THREAD(c);
+    if (c->shutting_down || !c->config.reconnect_enable) return MQVPN_ERR_INVALID_STATE;
+    if (c->state == MQVPN_STATE_IDLE || c->state == MQVPN_STATE_CLOSED)
+        return MQVPN_ERR_INVALID_STATE;
+
+    client_force_reconnect(c, "platform requested reconnect");
+    return MQVPN_OK;
+}
+
 /* ─── Path management ─── */
 
 /* Map the slot's lifecycle state after the synchronous activation half of
