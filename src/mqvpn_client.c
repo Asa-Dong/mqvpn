@@ -4351,9 +4351,12 @@ mqvpn_client_get_paths(const mqvpn_client_t *c, mqvpn_path_info_t *out, int max_
         out[i].bytes_tx = p->bytes_tx;
         out[i].bytes_rx = p->bytes_rx;
 
-        /* Map SRTT from xquic path metrics (us -> ms) */
+        /* SRTT is meaningful only for a currently usable path.  A soft
+         * suspended DEGRADED path deliberately retains its xquic binding,
+         * so querying it would otherwise expose the last pre-outage RTT as
+         * if it were a live measurement. */
         out[i].srtt_ms = 0;
-        if (p->xquic_path_live) {
+        if (p->status == MQVPN_PATH_ACTIVE && p->xquic_path_live) {
             const xqc_path_metrics_t *pm = xqc_find_path_metrics(&xstats, p->xqc_path_id);
             if (pm) out[i].srtt_ms = (int)(pm->path_srtt / 1000);
         }
