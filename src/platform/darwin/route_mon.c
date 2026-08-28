@@ -76,7 +76,19 @@ drop_reason_str(mqvpn_platform_reason_t reason)
 static void
 remove_path_by_index(platform_ctx_t *p, int idx, mqvpn_platform_reason_t reason)
 {
-    if (p->path_mgr.paths[idx].fd < 0) return; /* already removed */
+    if (p->path_mgr.paths[idx].fd < 0) {
+        /* A detach may follow a soft admin/carrier indication after that
+         * indication has closed the fd.  RTM_DELLINK remains authoritative:
+         * upgrade the retained CID/Path ID to a permanent drop. */
+        if (reason != MQVPN_PLATFORM_REASON_RTM_DELLINK) return;
+        LOG_WRN("routemon: interface %s removed after soft drop; abandoning path %d",
+                p->path_mgr.paths[idx].iface, idx);
+        mqvpn_platform_path_event_info_t info = {0};
+        snprintf(info.iface, sizeof(info.iface), "%s", p->path_mgr.paths[idx].iface);
+        info.reason = reason;
+        mqvpn_client_on_platform_path_dropped(p->client, p->lib_path_handles[idx], &info);
+        return;
+    }
 
     LOG_WRN("routemon: interface %s %s, closing path %d", p->path_mgr.paths[idx].iface,
             drop_reason_str(reason), idx);
@@ -459,9 +471,8 @@ try_readd_removed_path(platform_ctx_t *p, const char *ifname)
                 break;
             }
         }
-        /* Re-add candidate: slot exists in lib as CLOSED (DROPPED or FREE),
-         * or slot was never tracked (handle invalid / removed before lib saw it). */
-        if (found && st != MQVPN_PATH_CLOSED) continue;
+        int retained_path = found && st == MQVPN_PATH_DEGRADED;
+        if (found && st != MQVPN_PATH_CLOSED && !retained_path) continue;
 
         /* Definite "no FIB route to the server via this iface": re-adding
          * now would SO_BINDTODEVICE the challenge into the kernel's
@@ -481,6 +492,29 @@ try_readd_removed_path(platform_ctx_t *p, const char *ifname)
 
         mp->fd = fd;
         mp->platform_attached = 1;
+        if (retained_path) {
+            mqvpn_path_desc_t desc = {0};
+            desc.struct_size = sizeof(desc);
+            desc.fd = fd;
+            snprintf(desc.iface, sizeof(desc.iface), "%s", mp->iface);
+            if (mp->local_addrlen > 0 && mp->local_addrlen <= sizeof(desc.local_addr)) {
+                memcpy(desc.local_addr, &mp->local_addr, mp->local_addrlen);
+                desc.local_addr_len = mp->local_addrlen;
+            }
+            if (mqvpn_client_rebind_path_fd(p->client, h, fd, &desc) != MQVPN_OK) {
+                LOG_WRN("routemon: rebind retained path %s failed", ifname);
+                close(fd);
+                mp->fd = -1;
+                mp->platform_attached = 0;
+                return 0;
+            }
+            mp->xquic_path_live = 1;
+            p->ev_udp[i] = event_new(p->eb, fd, EV_READ | EV_PERSIST, on_socket_read, p);
+            event_add(p->ev_udp[i], NULL);
+            p->path_recover_failures[i] = 0;
+            LOG_INF("routemon: path %s rebound with retained CID/Path ID", ifname);
+            return 1;
+        }
         mp->xquic_path_live = 0;
         mp->path_id = 0;
 
@@ -610,14 +644,15 @@ recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg)
         }
 
         mqvpn_path_handle_t h = p->lib_path_handles[i];
-        int is_closed = 0;
+        int needs_socket = 0;
         for (int j = 0; j < n; j++) {
             if (pinfo[j].handle == h) {
-                is_closed = (pinfo[j].status == MQVPN_PATH_CLOSED);
+                needs_socket = (pinfo[j].status == MQVPN_PATH_CLOSED ||
+                                pinfo[j].status == MQVPN_PATH_DEGRADED);
                 break;
             }
         }
-        if (!is_closed) continue;
+        if (!needs_socket) continue;
 
         const char *ifname = p->path_mgr.paths[i].iface;
         if (!iface_is_up_and_running(ifname)) continue;

@@ -265,7 +265,8 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
          * against the new connection's retry budget. */
         memset(p->path_recover_failures, 0, sizeof(p->path_recover_failures));
         if (p->ev_status) event_del(p->ev_status); /* pause — reused on reconnect */
-        if (p->ev_recover) event_del(p->ev_recover);
+        /* Keep the underlay recovery poll armed: reconnect needs it to add
+         * a socket after all paths have disappeared. */
         cleanup_killswitch(p);
         if (p->manage_routes) cleanup_routes(p);
         mqvpn_dns_restore(&p->dns);

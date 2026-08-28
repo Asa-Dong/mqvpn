@@ -264,11 +264,11 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
     LOG_INF("state: %s -> %s", os, ns);
 
     if (new_state == MQVPN_STATE_RECONNECTING || new_state == MQVPN_STATE_CLOSED) {
-        /* Pause the recovery poll and reset its failure budget — reused on
-         * reconnect. route_gate_blocked is intentionally left untouched;
+        /* Keep the recovery poll running and reset its failure budget.
+         * A reconnect with every path closed depends on this poll to add a
+         * recovered underlay. route_gate_blocked is intentionally left untouched;
          * it self-resets in the reconciler (net_mon.c) when a route
          * reappears, per the field comment in platform_internal_win.h. */
-        if (p->ev_recover) event_del(p->ev_recover);
         memset(p->path_recover_failures, 0, sizeof(p->path_recover_failures));
         win_cleanup_killswitch(p);
         if (p->manage_routes) win_cleanup_routes(p);

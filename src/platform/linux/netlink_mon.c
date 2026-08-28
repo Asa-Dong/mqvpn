@@ -91,7 +91,21 @@ drop_reason_str(mqvpn_platform_reason_t reason)
 static void
 remove_path_by_index(platform_ctx_t *p, int idx, mqvpn_platform_reason_t reason)
 {
-    if (p->path_mgr.paths[idx].fd < 0) return; /* already removed */
+    if (p->path_mgr.paths[idx].fd < 0) {
+        /* A virtual device deletion can arrive as RTM_NEWLINK(admin-down)
+         * immediately followed by RTM_DELLINK.  The first event soft-suspends
+         * and closes the fd, so do not let the old "fd < 0" fast path swallow
+         * the definitive deletion.  Upgrade the retained path to a permanent
+         * drop: its CID/Path ID must never be rebound to a recreated device. */
+        if (reason != MQVPN_PLATFORM_REASON_RTM_DELLINK) return;
+        LOG_WRN("netlink: interface %s removed after soft drop; abandoning path %d",
+                p->path_mgr.paths[idx].iface, idx);
+        mqvpn_platform_path_event_info_t info = {0};
+        snprintf(info.iface, sizeof(info.iface), "%s", p->path_mgr.paths[idx].iface);
+        info.reason = reason;
+        mqvpn_client_on_platform_path_dropped(p->client, p->lib_path_handles[idx], &info);
+        return;
+    }
 
     LOG_WRN("netlink: interface %s %s, closing path %d", p->path_mgr.paths[idx].iface,
             drop_reason_str(reason), idx);
@@ -360,15 +374,10 @@ recovery_registration_rollback(platform_ctx_t *p, int slot)
 
 /* PR5: replace path_removed_by_platform[] polling with lib state query.
  * The slot is considered "ready for re-add" if its public status is
- * MQVPN_PATH_CLOSED — i.e., lib has fully cleaned up the previous incarnation
- * (CLOSED_FREE) OR is mid-cleanup (CLOSED_DROPPED). Note the re-add does not
- * necessarily recycle the same slot: add_path_fd's reuse scan requires a
- * fully-drained slot (status CLOSED && !platform_attached && !xquic_path_live),
- * so a CLOSED_DROPPED slot still awaiting xquic-side drain is skipped and a
- * fresh slot is appended instead — the re-add succeeds on the new slot while
- * the old one drains and is reclaimed to CLOSED_FREE later. n_paths therefore
- * grows monotonically under rapid flapping and self-heals; it only fails
- * (returns -1) if MQVPN_MAX_PATHS is reached before the stale slots drain. */
+ * MQVPN_PATH_CLOSED. A path whose xquic-side removal is still draining is not
+ * immediately reusable; recovery deliberately waits for its own slot instead
+ * of borrowing another interface's CLOSED slot and corrupting the stable
+ * interface → path mapping. */
 static int
 try_readd_removed_path(platform_ctx_t *p, const char *ifname)
 {
@@ -406,9 +415,10 @@ try_readd_removed_path(platform_ctx_t *p, const char *ifname)
                 break;
             }
         }
-        /* Re-add candidate: slot exists in lib as CLOSED (DROPPED or FREE),
-         * or slot was never tracked (handle invalid / removed before lib saw it). */
-        if (found && st != MQVPN_PATH_CLOSED) continue;
+        int retained_path = found && st == MQVPN_PATH_DEGRADED;
+        /* A DEGRADED slot with no platform fd is a soft outage retaining the
+         * old CID/Path ID. CLOSED is a true re-add that needs a new path. */
+        if (found && st != MQVPN_PATH_CLOSED && !retained_path) continue;
 
         /* Definite "no FIB route to the server via this iface": re-adding
          * now would SO_BINDTODEVICE the challenge into the kernel's
@@ -423,6 +433,36 @@ try_readd_removed_path(platform_ctx_t *p, const char *ifname)
 
         mp->fd = fd;
         mp->platform_attached = 1;
+
+        if (retained_path) {
+            mqvpn_path_desc_t desc = {0};
+            desc.struct_size = sizeof(desc);
+            desc.fd = fd;
+            snprintf(desc.iface, sizeof(desc.iface), "%s", mp->iface);
+            if (mp->local_addrlen > 0 && mp->local_addrlen <= sizeof(desc.local_addr)) {
+                memcpy(desc.local_addr, &mp->local_addr, mp->local_addrlen);
+                desc.local_addr_len = mp->local_addrlen;
+            }
+            if (mqvpn_client_rebind_path_fd(p->client, h, fd, &desc) != MQVPN_OK) {
+                LOG_WRN("netlink: rebind retained path %s failed", ifname);
+                close(fd);
+                mp->fd = -1;
+                mp->platform_attached = 0;
+                return 0;
+            }
+            mp->xquic_path_live = 1;
+            p->ev_udp[i] = event_new(p->eb, fd, EV_READ | EV_PERSIST, on_socket_read, p);
+            if (!p->ev_udp[i]) {
+                LOG_WRN("netlink: event creation for rebound path %s failed", ifname);
+                recovery_registration_rollback(p, i);
+                return 0;
+            }
+            event_add(p->ev_udp[i], NULL);
+            p->path_recover_failures[i] = 0;
+            LOG_INF("netlink: path %s rebound with retained CID/Path ID", ifname);
+            return 1;
+        }
+
         mp->xquic_path_live = 0;
         mp->path_id = 0;
 
@@ -532,14 +572,15 @@ recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg)
         }
 
         mqvpn_path_handle_t h = p->lib_path_handles[i];
-        int is_closed = 0;
+        int needs_socket = 0;
         for (int j = 0; j < n; j++) {
             if (pinfo[j].handle == h) {
-                is_closed = (pinfo[j].status == MQVPN_PATH_CLOSED);
+                needs_socket = (pinfo[j].status == MQVPN_PATH_CLOSED ||
+                                pinfo[j].status == MQVPN_PATH_DEGRADED);
                 break;
             }
         }
-        if (!is_closed) continue;
+        if (!needs_socket) continue;
 
         const char *ifname = p->path_mgr.paths[i].iface;
         if (!iface_is_up_and_running(ifname)) continue;

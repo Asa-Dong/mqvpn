@@ -243,7 +243,11 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
          * against the new connection's retry budget. */
         memset(p->path_recover_failures, 0, sizeof(p->path_recover_failures));
         if (p->ev_status) event_del(p->ev_status); /* pause — reused on reconnect */
-        if (p->ev_recover) event_del(p->ev_recover);
+        /* Keep the underlay recovery poll armed while reconnecting.  At this
+         * point every UDP path may be CLOSED and the next connection cannot
+         * start until this timer observes a recovered carrier/DHCP address
+         * and registers a new socket.  Pausing it creates a deadlock when a
+         * one-shot netlink recovery event is missed. */
         cleanup_killswitch(p);
         if (p->manage_routes) cleanup_routes(p);
         mqvpn_dns_restore(&p->dns);
