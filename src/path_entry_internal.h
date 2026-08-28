@@ -67,6 +67,12 @@ typedef struct path_entry_s {
     uint64_t recreate_after_us;
     int recreate_retries;
     uint64_t path_stable_since_us;
+    /* A platform-originated outage can detach the UDP fd without abandoning
+     * the MP-QUIC path.  While non-zero, the slot is DEGRADED with
+     * platform_attached=0 and xquic_path_live=1; the original Path ID/CIDs
+     * remain reserved until the fd is rebound or the bounded grace expires. */
+    uint64_t suspended_since_us;
+    path_lifecycle_t resume_state; /* ACTIVE/STANDBY/VALIDATING before soft suspend */
     uint64_t state_entered_at_us;       /* PR1 — Phase 1 observability */
     uint64_t last_residence_warn_at_us; /* PR1 — residence-warn debounce, used in B10 */
     int gso_disabled;                   /* runtime sticky: 0 = GSO usable, else the

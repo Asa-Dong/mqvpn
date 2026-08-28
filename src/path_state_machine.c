@@ -34,6 +34,7 @@ mqvpn_path_transition_reason_name(path_transition_reason_t r)
     case PATH_REASON_CONN_RESET: return "CONN_RESET";
     case PATH_REASON_RETRY_RESET: return "RETRY_RESET";
     case PATH_REASON_FD_CLOSED: return "FD_CLOSED";
+    case PATH_REASON_SOCKET_REBOUND: return "SOCKET_REBOUND";
     }
     return "UNKNOWN";
 }
@@ -185,12 +186,22 @@ path_invariant_check(const path_entry_t *p)
         assert(p->recreate_after_us == 0);
         break;
     case PATH_LC_DEGRADED:
-        assert(p->platform_attached == 1);
-        assert(p->xquic_path_live == 0);
-        assert(fd_valid);
-        assert(p->xqc_path_id == 0);
-        assert(p->recreate_after_us != 0);
-        assert(p->path_stable_since_us == 0);
+        if (p->platform_attached) {
+            /* xquic validation/removal failed: retry a brand-new path. */
+            assert(p->xquic_path_live == 0);
+            assert(fd_valid);
+            assert(p->xqc_path_id == 0);
+            assert(p->recreate_after_us != 0);
+            assert(p->suspended_since_us == 0);
+        } else {
+            /* Soft platform outage: no fd, retained Path ID/CIDs. */
+            assert(p->xquic_path_live == 1);
+            assert(p->recreate_after_us == 0);
+            assert(p->path_stable_since_us == 0);
+            assert(p->suspended_since_us != 0);
+            assert(p->resume_state == PATH_LC_ACTIVE || p->resume_state == PATH_LC_STANDBY ||
+                   p->resume_state == PATH_LC_VALIDATING);
+        }
         break;
     case PATH_LC_CLOSED_RECOVERABLE:
         assert(p->platform_attached == 1);
@@ -274,6 +285,8 @@ path_event_name(path_event_t ev)
     case PATH_EVENT_ADD_FD: return "ADD_FD";
     case PATH_EVENT_CONN_RESET: return "CONN_RESET";
     case PATH_EVENT_FD_CLOSED: return "FD_CLOSED";
+    case PATH_EVENT_PLATFORM_REBOUND: return "PLATFORM_REBOUND";
+    case PATH_EVENT_PLATFORM_SUSPEND: return "PLATFORM_SUSPEND";
     }
     return "?";
 }
@@ -321,6 +334,8 @@ g_p15_xqc_app_status_for(path_lifecycle_t from, path_lifecycle_t to)
     if (from == PATH_LC_STANDBY && to == PATH_LC_ACTIVE) return 2;
     if ((from == PATH_LC_ACTIVE || from == PATH_LC_STANDBY) && to == PATH_LC_DEGRADED)
         return 3;
+    if (from == PATH_LC_DEGRADED && to == PATH_LC_ACTIVE) return 2;
+    if (from == PATH_LC_DEGRADED && to == PATH_LC_STANDBY) return 1;
     return 0; /* no xquic call for other transitions */
 }
 
@@ -415,6 +430,10 @@ static void path_on_add_fd(mqvpn_client_t *, path_entry_t *, const path_event_ct
 static void path_on_conn_reset(mqvpn_client_t *, path_entry_t *,
                                const path_event_ctx_t *);
 static void path_on_fd_closed(mqvpn_client_t *, path_entry_t *, const path_event_ctx_t *);
+static void path_on_platform_rebound(mqvpn_client_t *, path_entry_t *,
+                                     const path_event_ctx_t *);
+static void path_on_platform_suspend(mqvpn_client_t *, path_entry_t *,
+                                     const path_event_ctx_t *);
 static void maybe_transition_dropped_to_free(mqvpn_client_t *, path_entry_t *,
                                              path_transition_reason_t);
 
@@ -441,6 +460,8 @@ path_on_event(mqvpn_client_t *c, path_entry_t *p, path_event_t ev,
     case PATH_EVENT_ADD_FD: path_on_add_fd(c, p, ctx); break;
     case PATH_EVENT_CONN_RESET: path_on_conn_reset(c, p, ctx); break;
     case PATH_EVENT_FD_CLOSED: path_on_fd_closed(c, p, ctx); break;
+    case PATH_EVENT_PLATFORM_REBOUND: path_on_platform_rebound(c, p, ctx); break;
+    case PATH_EVENT_PLATFORM_SUSPEND: path_on_platform_suspend(c, p, ctx); break;
     }
 
     /* Single invariant + path_event emission point. */
@@ -616,10 +637,37 @@ path_on_platform_drop(mqvpn_client_t *c, path_entry_t *p, const path_event_ctx_t
     p->platform_attached = 0;
     p->recreate_after_us = 0;
     p->path_stable_since_us = 0;
+    p->suspended_since_us = 0;
+    p->resume_state = PATH_LC_PENDING;
     /* FSM stays xquic-API-free; the PATH_ABANDON for CID/path_id reuse is
      * emitted by the caller (mqvpn_client_on_platform_path_dropped) before
      * this event, not here — see Spec §5.0. */
     set_path_state_with_log(c, p, PATH_LC_CLOSED_DROPPED, PATH_REASON_PLATFORM_DROPPED);
+}
+
+/* A carrier/address/admin-down event only invalidates the local UDP fd. Keep
+ * the xquic path/CIDs alive and freeze it until a replacement socket arrives. */
+static void
+path_on_platform_suspend(mqvpn_client_t *c, path_entry_t *p, const path_event_ctx_t *ctx)
+{
+    if (p->state == PATH_LC_DEGRADED && !p->platform_attached &&
+        p->xquic_path_live) {
+        return; /* duplicate platform-down notification */
+    }
+    if (p->state != PATH_LC_ACTIVE && p->state != PATH_LC_STANDBY &&
+        p->state != PATH_LC_VALIDATING ||
+        !p->platform_attached || !p->xquic_path_live) {
+        client_log(c, MQVPN_LOG_WARN,
+                   "path[%s] PLATFORM_SUSPEND in unexpected state %s", p->name,
+                   path_lifecycle_name(p->state));
+        return;
+    }
+    p->resume_state = p->state;
+    p->platform_attached = 0;
+    p->recreate_after_us = 0;
+    p->path_stable_since_us = 0;
+    p->suspended_since_us = ctx->now_us;
+    set_path_state_with_log(c, p, PATH_LC_DEGRADED, PATH_REASON_PLATFORM_DROPPED);
 }
 
 static void
@@ -634,6 +682,8 @@ path_on_remove_api(mqvpn_client_t *c, path_entry_t *p, const path_event_ctx_t *c
     p->platform_attached = 0;
     p->recreate_after_us = 0;
     p->path_stable_since_us = 0;
+    p->suspended_since_us = 0;
+    p->resume_state = PATH_LC_PENDING;
     set_path_state_with_log(c, p, PATH_LC_CLOSED_DROPPED, PATH_REASON_REMOVE_API);
 }
 
@@ -661,11 +711,22 @@ path_on_conn_reset(mqvpn_client_t *c, path_entry_t *p, const path_event_ctx_t *c
     p->recreate_after_us = 0;
     p->recreate_retries = 0;
     p->path_stable_since_us = 0;
+    p->suspended_since_us = 0;
+    p->resume_state = PATH_LC_PENDING;
 
     if (p->platform_attached) {
         set_path_state_with_log(c, p, PATH_LC_PENDING, PATH_REASON_CONN_RESET);
+    } else if (p->fd < 0) {
+        /* A whole-connection reconnect invalidates every retained CID/Path
+         * binding.  A soft-suspended slot has already had its UDP fd closed;
+         * it must therefore become CLOSED_FREE so the platform recovery
+         * monitor creates a fresh xquic path on the new connection.  Leaving
+         * it DEGRADED makes the monitor attempt a CID-preserving rebind onto
+         * the dead connection, which can never succeed. */
+        set_path_state_with_log(c, p, PATH_LC_CLOSED_FREE, PATH_REASON_CONN_RESET);
     } else {
-        maybe_transition_dropped_to_free(c, p, PATH_REASON_CONN_RESET);
+        /* Preserve the short drop/close ordering window until FD_CLOSED. */
+        set_path_state_with_log(c, p, PATH_LC_CLOSED_DROPPED, PATH_REASON_CONN_RESET);
     }
 }
 
@@ -678,6 +739,13 @@ path_on_fd_closed(mqvpn_client_t *c, path_entry_t *p, const path_event_ctx_t *ct
      * Other states: late async race - LOG_D + no-op (spec sec 5.1 tail
      * "Late async callback no atsukai"). CLOSED_FREE also late-event
      * idempotent (state unchanged, cleanup already complete). */
+    if (p->state == PATH_LC_DEGRADED && !p->platform_attached &&
+        p->xquic_path_live) {
+        /* Soft suspend: the old kernel fd is gone, but xquic's Path ID/CID
+         * binding deliberately remains alive until a replacement fd arrives. */
+        p->fd = -1;
+        return;
+    }
     if (p->state != PATH_LC_CLOSED_DROPPED) {
         client_log(c, MQVPN_LOG_DEBUG, "path[%s] FD_CLOSED (late) in state %s, ignoring",
                    p->name, path_lifecycle_name(p->state));
@@ -686,6 +754,31 @@ path_on_fd_closed(mqvpn_client_t *c, path_entry_t *p, const path_event_ctx_t *ct
     /* fd is NOT in spec sec 3.3 lifecycle field list - direct write allowed. */
     p->fd = -1;
     maybe_transition_dropped_to_free(c, p, PATH_REASON_FD_CLOSED);
+}
+
+/* A temporary platform outage closed only the UDP fd.  The caller has already
+ * installed the new fd/address fields; restore the pre-suspend application
+ * status so xquic emits PATH_STATUS on the retained Path ID.  The peer then
+ * validates the changed tuple through its normal NAT-rebinding logic. */
+static void
+path_on_platform_rebound(mqvpn_client_t *c, path_entry_t *p, const path_event_ctx_t *ctx)
+{
+    if (p->state != PATH_LC_DEGRADED || p->platform_attached ||
+        !p->xquic_path_live || p->fd < 0 || p->suspended_since_us == 0 ||
+        (p->resume_state != PATH_LC_ACTIVE && p->resume_state != PATH_LC_STANDBY &&
+         p->resume_state != PATH_LC_VALIDATING)) {
+        client_log(c, MQVPN_LOG_WARN,
+                   "path[%s] PLATFORM_REBOUND in unexpected state", p->name);
+        return;
+    }
+    path_lifecycle_t target = p->resume_state;
+    p->platform_attached = 1;
+    p->recreate_after_us = 0;
+    p->path_stable_since_us =
+        (target == PATH_LC_ACTIVE || target == PATH_LC_STANDBY) ? ctx->now_us : 0;
+    p->suspended_since_us = 0;
+    p->resume_state = PATH_LC_PENDING;
+    set_path_state_with_log(c, p, target, PATH_REASON_SOCKET_REBOUND);
 }
 
 static void

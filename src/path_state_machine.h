@@ -46,6 +46,8 @@ typedef enum {
     PATH_EVENT_ADD_FD,
     PATH_EVENT_CONN_RESET,
     PATH_EVENT_FD_CLOSED, /* PR5 - platform reports fd close completion */
+    PATH_EVENT_PLATFORM_REBOUND, /* new fd resumes a retained xquic path */
+    PATH_EVENT_PLATFORM_SUSPEND, /* temporary outage: retain xquic path */
 } path_event_t;
 
 /* Activation attempt classification (spec §6.6). */
@@ -93,6 +95,10 @@ _Static_assert(PATH_EVENT_CONN_RESET == 8,
 _Static_assert(PATH_EVENT_FD_CLOSED == 9,
                "path_event_t shape changed - review path_on_event dispatch + "
                "path_on_fd_closed handler");
+_Static_assert(PATH_EVENT_PLATFORM_REBOUND == 10,
+               "path_event_t shape changed - review path_on_event dispatch");
+_Static_assert(PATH_EVENT_PLATFORM_SUSPEND == 11,
+               "path_event_t shape changed - review path_on_event dispatch");
 
 /* Reason tag for transition logs. Phase 4 will extend this. */
 typedef enum {
@@ -106,6 +112,7 @@ typedef enum {
     PATH_REASON_CONN_RESET,
     PATH_REASON_RETRY_RESET,
     PATH_REASON_FD_CLOSED, /* PR5 - symmetric with PATH_REASON_XQUIC_REMOVED */
+    PATH_REASON_SOCKET_REBOUND,
 } path_transition_reason_t;
 
 /* Phase 2 (PR2): internal 7-state lifecycle helpers.
@@ -175,6 +182,13 @@ MQVPN_INTERNAL int path_is_real_transition(mqvpn_path_status_t old,
 #define PATH_RECREATE_MAX_DELAY_US (3ULL * 1000000)  /* 3 sec max backoff */
 #define PATH_RECREATE_MAX_RETRIES  100000            /* continuous retry without giving up */
 #define PATH_STABLE_THRESHOLD_US   (30ULL * 1000000) /* 30 sec to confirm stable */
+/* Keep a retained path/CID while another uplink keeps the connection alive.
+ * A permanently missing interface must still eventually release peer state. */
+#define PATH_SUSPEND_ABANDON_GRACE_US (30ULL * 60ULL * 1000000) /* 30 min */
+/* With every uplink suspended there is no way to keep a QUIC connection alive
+ * indefinitely.  Leave room for a short WAN flap, but reconnect before the
+ * peer's normal 120s idle timeout can discard the CID mapping. */
+#define PATH_ALL_SUSPENDED_RECONNECT_GRACE_US (90ULL * 1000000) /* 90 sec */
 
 /* PR4 - Relocated from mqvpn_client.c (originally static). path_on_event()
  * body and the residual callsites that still emit explicit reason tags

@@ -690,16 +690,24 @@ MQVPN_API mqvpn_path_handle_t mqvpn_client_add_path_fd_with_outcome(
     mqvpn_client_t *client, int fd, const mqvpn_path_desc_t *desc,
     mqvpn_add_path_outcome_t *outcome);
 
+/* Attach a freshly-created UDP socket to a path that was temporarily
+ * suspended by mqvpn_client_on_platform_path_dropped().  This preserves the
+ * existing xquic Path ID and all CIDs; it does NOT create a new MP-QUIC path.
+ *
+ * Valid only after a carrier/address/admin-down drop whose old fd has been
+ * closed and reported with mqvpn_client_on_platform_fd_closed().  On success
+ * the library owns fd exactly as it does for add_path_fd(); on failure the
+ * caller retains ownership and must close fd.  Interface deletion and
+ * explicit remove_path are permanent and must use add_path_fd instead. */
+MQVPN_API int mqvpn_client_rebind_path_fd(mqvpn_client_t *client,
+                                          mqvpn_path_handle_t path, int fd,
+                                          const mqvpn_path_desc_t *desc);
+
 MQVPN_API int mqvpn_client_remove_path(mqvpn_client_t *client, mqvpn_path_handle_t path);
 
 /*
- * Drop a path slot on platform-detected removal (carrier loss, RTM_DELLINK,
- * address loss). Moves the slot to the CLOSED_DROPPED cleanup state and emits
- * a non-blocking PATH_ABANDON so xquic releases the dead path's CID/path_id
- * slot for reuse (draft-21); this does not stall surviving paths. The fd is
- * assumed already dead: close it and call mqvpn_client_on_platform_fd_closed()
- * to drive the lazy cleanup to completion (CLOSED_FREE), after which the slot
- * is reusable by add_path_fd().
+ * Drop a path slot without platform diagnostics.  This is a permanent removal:
+ * it emits PATH_ABANDON and the slot becomes reusable after fd cleanup.
  */
 MQVPN_API int mqvpn_client_drop_path(mqvpn_client_t *client, mqvpn_path_handle_t path);
 
@@ -707,10 +715,11 @@ MQVPN_API int mqvpn_client_drop_path(mqvpn_client_t *client, mqvpn_path_handle_t
  * Platform reports that a path is no longer reachable via its current fd
  * (carrier loss, RTM_DELLINK, NotifyIpInterfaceChange ifDown, etc).
  *
- * Library transitions the slot to PATH_CLOSED_DROPPED (via EVENT_PLATFORM_DROP).
- * The fd is left for the platform to close; call
- * mqvpn_client_on_platform_fd_closed() after close() to drive the lazy
- * CLOSED_DROPPED -> CLOSED_FREE cleanup.
+ * RTM_DELLINK is a permanent removal and transitions the slot to
+ * PATH_CLOSED_DROPPED.  Carrier loss, admin down and address removal are soft
+ * outages: the library freezes the live MP-QUIC path, retains its Path ID/CIDs,
+ * and waits for mqvpn_client_rebind_path_fd().  The fd is always left for the
+ * platform to close; call mqvpn_client_on_platform_fd_closed() after close().
  *
  * info may be NULL - in that case behaves identically to
  * mqvpn_client_drop_path() with no diagnostic context.
@@ -723,8 +732,8 @@ mqvpn_client_on_platform_path_dropped(mqvpn_client_t *client, mqvpn_path_handle_
 /*
  * Platform reports that the fd for the given path has been closed.
  *
- * Library sets p->fd = -1 and re-evaluates the CLOSED_DROPPED ->
- * CLOSED_FREE cleanup completion.
+ * Library sets p->fd = -1 and either completes permanent cleanup or records
+ * completion of a soft suspension before a replacement fd is rebound.
  *
  * Returns:
  *   MQVPN_OK              - handle found; FSM dispatched. Late-arrival on

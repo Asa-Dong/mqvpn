@@ -697,14 +697,16 @@ test_dispatch_table(void)
          {.result = ACTIVATE_PERMANENT_FAIL, .now_us = 2000},
          PATH_LC_CLOSED_RECOVERABLE,
          0},
-        /* 3: MAX guard — CREATE_WAIT retries=5 + RETRY_TIMER(TRANSIENT) */
-        {"CREATE_WAIT retries=5 + RETRY_TIMER(TRANSIENT) -> MAX",
+        /* 3: MAX guard — pin to the configured retry limit, not a stale
+         * literal (the production policy intentionally permits long WAN
+         * recovery windows). */
+        {"CREATE_WAIT retries=MAX-1 + RETRY_TIMER(TRANSIENT) -> MAX",
          PATH_LC_CREATE_WAIT,
          /*pa=*/1,
          /*xpl=*/0,
          /*rec_after=*/1000,
          /*pss=*/0,
-         /*retries=*/5,
+         /*retries=*/PATH_RECREATE_MAX_RETRIES - 1,
          /*xqc=*/0,
          PATH_EVENT_RETRY_TIMER,
          {.result = ACTIVATE_TRANSIENT_FAIL, .now_us = 2000},
@@ -885,6 +887,72 @@ test_fd_closed_sequence_to_free(void)
     assert(p.state == PATH_LC_CLOSED_FREE);
 }
 
+/* A temporary link loss must detach only the fd.  The Path ID and xquic-live
+ * binding survive through DEGRADED, then a new fd restores the same logical
+ * path rather than allocating create_path()'s next ID. */
+static void
+test_soft_suspend_rebind_retains_path(void)
+{
+    path_entry_t p = {0};
+    p.fd = 7;
+    p.state = PATH_LC_ACTIVE;
+    p.status = MQVPN_PATH_ACTIVE;
+    p.platform_attached = 1;
+    p.xquic_path_live = 1;
+    p.xqc_path_id = 42;
+
+    path_event_ctx_t ctx = {.now_us = 1000};
+    path_on_event(NULL, &p, PATH_EVENT_PLATFORM_SUSPEND, &ctx);
+    assert(p.state == PATH_LC_DEGRADED);
+    assert(p.platform_attached == 0);
+    assert(p.xquic_path_live == 1);
+    assert(p.xqc_path_id == 42);
+    assert(p.suspended_since_us == 1000);
+    assert(p.resume_state == PATH_LC_ACTIVE);
+
+    p.fd = -1; /* platform closed the old kernel socket */
+    path_on_event(NULL, &p, PATH_EVENT_FD_CLOSED, &ctx);
+    assert(p.state == PATH_LC_DEGRADED);
+    assert(p.xquic_path_live == 1);
+    assert(p.xqc_path_id == 42);
+
+    p.fd = 8; /* newly-created, interface-pinned UDP socket */
+    ctx.now_us = 2000;
+    path_on_event(NULL, &p, PATH_EVENT_PLATFORM_REBOUND, &ctx);
+    assert(p.state == PATH_LC_ACTIVE);
+    assert(p.platform_attached == 1);
+    assert(p.xquic_path_live == 1);
+    assert(p.xqc_path_id == 42);
+    assert(p.suspended_since_us == 0);
+}
+
+/* A retained CID belongs to its current QUIC connection only.  If every
+ * underlay is lost and the connection resets, recovery must create a fresh
+ * path rather than attempting to rebind this slot to that dead connection. */
+static void
+test_soft_suspended_conn_reset_releases_path(void)
+{
+    path_entry_t p = {0};
+    p.fd = 7;
+    p.state = PATH_LC_ACTIVE;
+    p.status = MQVPN_PATH_ACTIVE;
+    p.platform_attached = 1;
+    p.xquic_path_live = 1;
+    p.xqc_path_id = 42;
+
+    path_event_ctx_t ctx = {.now_us = 1000};
+    path_on_event(NULL, &p, PATH_EVENT_PLATFORM_SUSPEND, &ctx);
+    p.fd = -1;
+    path_on_event(NULL, &p, PATH_EVENT_FD_CLOSED, &ctx);
+    path_on_event(NULL, &p, PATH_EVENT_CONN_RESET, &ctx);
+
+    assert(p.state == PATH_LC_CLOSED_FREE);
+    assert(!p.platform_attached);
+    assert(!p.xquic_path_live);
+    assert(p.xqc_path_id == 0);
+    assert(p.suspended_since_us == 0);
+}
+
 /* Spec sec 6.3: after 30s ACTIVE/STANDBY residency triggers the retry-reset,
  * the timer MUST re-arm to `now` so subsequent 30s windows continue to fire.
  * Pre-fix code wrote `path_stable_since_us = 0` which disarmed the timer
@@ -1035,6 +1103,10 @@ main(void)
     test_dispatch_table();
     test_fd_closed_sequence_to_free();
     printf("  test_fd_closed_sequence_to_free: OK\n");
+    test_soft_suspend_rebind_retains_path();
+    printf("  test_soft_suspend_rebind_retains_path: OK\n");
+    test_soft_suspended_conn_reset_releases_path();
+    printf("  test_soft_suspended_conn_reset_releases_path: OK\n");
     test_stable_reset_rearms_timer();
     printf("  test_stable_reset_rearms_timer: OK\n");
     test_g_p15_lifecycle_notifies_xquic();

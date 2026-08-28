@@ -73,6 +73,11 @@
  * this window, so a dead first-listed path triggers reconnect (and primary_path_idx
  * rotation, issue #46) rather than waiting for xquic's idle_time_out (120s). */
 #define HANDSHAKE_STALL_TIMEOUT_MS 2500
+/* xquic asks the peer for more path-id credit with PATHS_BLOCKED before
+ * returning -XQC_EMP_NO_AVAIL_PATH_ID.  A compatible peer normally answers
+ * within one PTO.  Do not leave one recovered WAN in CREATE_WAIT forever if
+ * that control-plane exchange cannot complete on an older or unhealthy peer. */
+#define PATH_ID_EXHAUSTED_RECONNECT_GRACE_US (5ULL * 1000000)
 /* PATH_RECREATE_* and PATH_STABLE_THRESHOLD_US relocated to path_state_machine.h
  * for PR4 — shared with path_state_machine.c. */
 #define SOCKET_BUF_SIZE (7 * 1024 * 1024) /* 7 MiB socket buffer */
@@ -287,6 +292,11 @@ struct mqvpn_client_s {
 
     /* Timestamp when all paths became dead in ESTABLISHED state */
     uint64_t all_paths_dead_since_us;
+
+    /* First -XQC_EMP_NO_AVAIL_PATH_ID seen while trying to recover a path.
+     * Cleared when a new path is created successfully or before a forced
+     * reconnect. */
+    uint64_t path_id_exhausted_since_us;
 
     /* ICMP PTB rate limit */
     mqvpn_ptb_bucket_t ptb_bucket;
@@ -2439,7 +2449,17 @@ activate_via_xquic_classify(mqvpn_client_t *c, uint64_t *out_path_id)
     *out_path_id = 0;
     xqc_int_t ret =
         xqc_conn_create_path(c->engine, &c->conn->cid, out_path_id, path_status);
-    if (ret == 0) return ACTIVATE_OK;
+    if (ret == 0) {
+        c->path_id_exhausted_since_us = 0;
+        return ACTIVATE_OK;
+    }
+    if (ret == -XQC_EMP_NO_AVAIL_PATH_ID) {
+        if (c->path_id_exhausted_since_us == 0) {
+            c->path_id_exhausted_since_us = client_now_us(c);
+            LOG_W(c, "path-id credit exhausted; waiting for peer MAX_PATH_ID");
+        }
+        return ACTIVATE_TRANSIENT_FAIL;
+    }
     if (ret == -XQC_EMP_CREATE_PATH) return ACTIVATE_PERMANENT_FAIL;
     return ACTIVATE_TRANSIENT_FAIL;
 }
@@ -3278,13 +3298,39 @@ mqvpn_client_add_path_fd_with_outcome(mqvpn_client_t *c, int fd,
      * leaving xquic's removal accounting unreconciled with the lib slot.
      * Waiting for xquic-side cleanup (xquic_path_live=0) is the natural fence. */
     int idx = -1;
+    int same_iface_slot_exists = 0;
+    const char *requested_iface = desc ? desc->iface : "";
     for (int i = 0; i < c->n_paths; i++) {
-        if (c->paths[i].status == MQVPN_PATH_CLOSED && !c->paths[i].platform_attached &&
-            !c->paths[i].xquic_path_live) {
+        /* Platform recovery has a stable interface → path-slot mapping.
+         * Never let a recovering eth0.101 borrow eth0.103's free slot just
+         * because eth0.101's old xquic PATH_ABANDON has not drained yet.
+         * Wait for that matching slot instead; the platform recovery timer
+         * will retry.  Cross-interface reuse corrupts the configured path
+         * map and makes the displaced interface unrecoverable. */
+        int same_iface = requested_iface[0] != '\0' &&
+                         strcmp(c->paths[i].name, requested_iface) == 0;
+        if (same_iface) same_iface_slot_exists = 1;
+        if (same_iface && c->paths[i].status == MQVPN_PATH_CLOSED &&
+            !c->paths[i].platform_attached && !c->paths[i].xquic_path_live) {
             idx = i;
             break;
         }
     }
+    if (idx < 0 && !same_iface_slot_exists) {
+        for (int i = 0; i < c->n_paths; i++) {
+            if (c->paths[i].status == MQVPN_PATH_CLOSED &&
+                !c->paths[i].platform_attached && !c->paths[i].xquic_path_live) {
+                idx = i;
+                break;
+            }
+        }
+    }
+    /* A matching interface that is still draining its old PATH_ABANDON is
+     * deliberately not replaceable yet.  Appending a second slot here would
+     * create two owners for one interface and reintroduce the duplicate-101
+     * failure by a different route.  The platform recovery timer retries
+     * after cb_path_removed makes this exact slot reusable. */
+    if (idx < 0 && same_iface_slot_exists) return -1;
     if (idx < 0) {
         if (c->n_paths >= MQVPN_MAX_PATHS) return -1;
         idx = c->n_paths++;
@@ -3358,6 +3404,13 @@ path_xquic_abandon_due(const path_entry_t *p)
     return p->xquic_path_live != 0;
 }
 
+static int
+path_is_soft_suspended(const path_entry_t *p)
+{
+    return p->state == PATH_LC_DEGRADED && !p->platform_attached &&
+           p->xquic_path_live && p->suspended_since_us != 0;
+}
+
 int
 mqvpn_client_remove_path(mqvpn_client_t *c, mqvpn_path_handle_t path)
 {
@@ -3402,14 +3455,25 @@ mqvpn_client_on_platform_path_dropped(mqvpn_client_t *c, mqvpn_path_handle_t han
               (long long)handle, info->iface, (int)info->reason);
     }
 
-    /* Draft-21 PATH_ABANDON: tell xquic to abandon the dead path so its
-     * CID/path_id slot is released for reuse. Non-blocking (queues frame
-     * on an alternate path). Fails gracefully if this is the only active
-     * path or if the connection is already closing. */
+    path_event_ctx_t ctx = {.now_us = client_now_us(c)};
+    /* A link/IP/admin flap does not mean the logical MP-QUIC path was
+     * intentionally retired.  Keep its Path ID/CIDs so the replacement UDP
+     * socket can continue it.  RTM_DELLINK (and legacy NULL-info drop_path)
+     * remains permanent because there is no stable interface identity to
+     * rebind.  A path that never reached xquic-live has nothing to retain. */
+    int soft = info && info->reason != MQVPN_PLATFORM_REASON_RTM_DELLINK &&
+               p->xquic_path_live &&
+               (p->state == PATH_LC_ACTIVE || p->state == PATH_LC_STANDBY ||
+                p->state == PATH_LC_VALIDATING ||
+                path_is_soft_suspended(p));
+    if (soft) {
+        path_on_event(c, p, PATH_EVENT_PLATFORM_SUSPEND, &ctx);
+        return MQVPN_OK;
+    }
+
+    /* Permanent removal: PATH_ABANDON is irreversible for this connection. */
     if (path_xquic_abandon_due(p) && c->engine && c->conn)
         xqc_conn_close_path(c->engine, &c->conn->cid, p->xqc_path_id);
-
-    path_event_ctx_t ctx = {.now_us = client_now_us(c)};
     path_on_event(c, p, PATH_EVENT_PLATFORM_DROP, &ctx);
     return MQVPN_OK;
 }
@@ -3424,6 +3488,53 @@ mqvpn_client_on_platform_fd_closed(mqvpn_client_t *c, mqvpn_path_handle_t handle
 
     path_event_ctx_t ctx = {.now_us = client_now_us(c)};
     path_on_event(c, p, PATH_EVENT_FD_CLOSED, &ctx);
+    return MQVPN_OK;
+}
+
+int
+mqvpn_client_rebind_path_fd(mqvpn_client_t *c, mqvpn_path_handle_t handle, int fd,
+                            const mqvpn_path_desc_t *desc)
+{
+    if (!c || fd < 0) return MQVPN_ERR_INVALID_ARG;
+    ASSERT_TICK_THREAD(c);
+    path_entry_t *p = find_path_by_handle(c, handle);
+    if (!p || !path_is_soft_suspended(p) || p->fd >= 0) return MQVPN_ERR_INVALID_STATE;
+
+    /* Ownership transfers only after the precondition above succeeds.  Keep
+     * the exact same path slot/handle/xqc_path_id; unlike add_path_fd this
+     * must never call xqc_conn_create_path(). */
+    p->fd = fd;
+    p->gso_disabled = 0;
+    int bufsize = SOCKET_BUF_SIZE;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&bufsize, sizeof(bufsize));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *)&bufsize, sizeof(bufsize));
+#ifdef SO_SNDBUFFORCE
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, (const char *)&bufsize, sizeof(bufsize));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, (const char *)&bufsize, sizeof(bufsize));
+#endif
+    if (desc) {
+        if (desc->iface[0]) {
+            memcpy(p->name, desc->iface, sizeof(p->name));
+            p->name[sizeof(p->name) - 1] = '\0';
+        }
+        if (desc->local_addr_len > 0 && desc->local_addr_len <= sizeof(p->local_addr)) {
+            memcpy(&p->local_addr, &desc->local_addr, desc->local_addr_len);
+            p->local_addr_len = desc->local_addr_len;
+        }
+        p->platform_net_id = desc->platform_net_id;
+        p->flags = desc->flags;
+    }
+
+    path_event_ctx_t ctx = {.now_us = client_now_us(c)};
+    path_on_event(c, p, PATH_EVENT_PLATFORM_REBOUND, &ctx);
+    if (!p->platform_attached) {
+        /* Defensive: unexpected state/event must not leave an fd owned by an
+         * unreachable slot.  Caller still owns it on this error path. */
+        p->fd = -1;
+        return MQVPN_ERR_INVALID_STATE;
+    }
+    LOG_I(c, "platform rebound path: %s path_id=%" PRIu64 " (CID retained)",
+          p->name, p->xqc_path_id);
     return MQVPN_OK;
 }
 
@@ -3995,8 +4106,23 @@ tick_path_recovery(mqvpn_client_t *c)
     tick_check_all_validations(c, now);
     int active_paths = 0;
     int validating_paths = 0;
+    int suspended_paths = 0;
     for (int i = 0; i < c->n_paths; i++) {
         path_entry_t *p = &c->paths[i];
+
+        /* A retained path only makes sense while another path carries the
+         * connection.  Bound its lifetime so a genuinely vanished interface
+         * eventually releases the peer's CID/path state. */
+        if (path_is_soft_suspended(p) &&
+            now - p->suspended_since_us >= PATH_SUSPEND_ABANDON_GRACE_US) {
+            LOG_W(c, "path[%d] %s suspended for 30m; abandoning retained path_id=%" PRIu64,
+                  i, p->name, p->xqc_path_id);
+            if (c->engine && c->conn)
+                xqc_conn_close_path(c->engine, &c->conn->cid, p->xqc_path_id);
+            path_event_ctx_t drop_ctx = {.now_us = now};
+            path_on_event(c, p, PATH_EVENT_PLATFORM_DROP, &drop_ctx);
+        }
+
         client_path_residence_check(c, p, now);
         tick_drive_retry_timer(c, p, i, now);
         path_fsm_tick_confirm_stable(c, p, now);
@@ -4004,6 +4130,20 @@ tick_path_recovery(mqvpn_client_t *c)
             active_paths++;
         else if (p->state == PATH_LC_VALIDATING)
             validating_paths++;
+        else if (path_is_soft_suspended(p))
+            suspended_paths++;
+    }
+
+    /* A surviving path keeps the normal "all paths dead" reconnect guard
+     * inactive.  That is normally correct, but it also means an exhausted
+     * peer path-id budget can strand every recovered underlay in CREATE_WAIT
+     * indefinitely.  Give the PATHS_BLOCKED/MAX_PATH_ID exchange time to
+     * succeed, then renew the QUIC connection and its path-id namespace. */
+    if (active_paths > 0 && c->path_id_exhausted_since_us != 0 &&
+        now - c->path_id_exhausted_since_us > PATH_ID_EXHAUSTED_RECONNECT_GRACE_US) {
+        c->path_id_exhausted_since_us = 0;
+        client_force_reconnect(c, "path-id credit unavailable for >5s");
+        return;
     }
 
     if (active_paths == 0) {
@@ -4014,14 +4154,17 @@ tick_path_recovery(mqvpn_client_t *c)
          * connection ESTABLISHED forever with every path projected as pending.
          * Give a genuine validation a short chance, then reconnect in-process
          * so the next connection starts on one of the recovered underlays. */
-        uint64_t grace_us = validating_paths ? 1000000ULL : 3ULL * 1000000;
+        uint64_t grace_us = suspended_paths ? PATH_ALL_SUSPENDED_RECONNECT_GRACE_US
+                              : validating_paths ? 1000000ULL : 3ULL * 1000000;
         if (c->all_paths_dead_since_us == 0) {
             c->all_paths_dead_since_us = now;
         } else if (now - c->all_paths_dead_since_us > grace_us) {
             c->all_paths_dead_since_us = 0;
-            client_force_reconnect(c, validating_paths
-                                          ? "no active path; validation stalled for >1s"
-                                          : "all paths dead for >3s");
+            client_force_reconnect(c, suspended_paths
+                                          ? "all paths suspended for >90s"
+                                          : validating_paths
+                                                ? "no active path; validation stalled for >1s"
+                                                : "all paths dead for >3s");
         }
     } else {
         c->all_paths_dead_since_us = 0;
@@ -4276,6 +4419,18 @@ mqvpn_client_get_interest(const mqvpn_client_t *c, mqvpn_interest_t *out)
                 if (p->recreate_after_us > now_val) {
                     int pms = (int)((p->recreate_after_us - now_val) / 1000);
                     if (ms > 0 && pms < ms) ms = pms;
+                } else {
+                    ms = 1;
+                }
+            }
+            /* Soft-suspended paths have no xquic retry deadline, but their
+             * bounded retain window must still wake embedding reactors even
+             * when no UDP or timer event arrives. */
+            if (path_is_soft_suspended(p)) {
+                uint64_t abandon_at = p->suspended_since_us + PATH_SUSPEND_ABANDON_GRACE_US;
+                if (abandon_at > now_val) {
+                    int sms = (int)((abandon_at - now_val) / 1000);
+                    if (ms > 0 && sms < ms) ms = sms;
                 } else {
                     ms = 1;
                 }
