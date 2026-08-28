@@ -285,7 +285,7 @@ ip netns exec "$NS_CLIENT" ip link set "$VETH_B0" up
 # interface's own address) but the manually-added via-route to the
 # server's /24 is gone and stays gone until we add it back below.
 
-READD_PATTERN="path ${VETH_B0} re-added|timer re-added path ${VETH_B0}"
+READD_PATTERN="path ${VETH_B0} re-added|timer re-added path ${VETH_B0}|path ${VETH_B0} rebound with retained CID/Path ID"
 GATE_PATTERN="netlink: ${VETH_B0} has a usable address but no route to the server — re-add deferred until a route appears"
 
 echo "Observing for 15s: gate log must appear, no re-add, no PENDING stuck..."

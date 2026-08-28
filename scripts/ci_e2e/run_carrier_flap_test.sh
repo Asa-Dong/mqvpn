@@ -270,19 +270,19 @@ else
 fi
 
 # =================================================================
-#  Test 2: peer-side link up → carrier restored, path re-added
+#  Test 2: peer-side link up → carrier restored, retained path rebound
 #  (via netlink event OR 3s recovery timer)
 # =================================================================
 
 echo ""
-echo "=== Test 2: Carrier restore (peer-side ip link set up) — path re-added ==="
+echo "=== Test 2: Carrier restore (peer-side ip link set up) — path rebound ==="
 
 UP_MARK=$(wc -l <"${WORK_DIR}/client.log")
 
 ip netns exec "$NS_SERVER" ip link set "$VETH_A1" up
 # Client-side veth-a0-cf was never admin-downed, so this restores carrier.
 
-READD_PATTERN="path .* re-added|timer re-added path"
+READD_PATTERN="path .* re-added|timer re-added path|path ${VETH_A0} rebound with retained CID/Path ID"
 
 # Allow up to 20s — the recovery timer fires every 3s, so even if the
 # RTM_NEWLINK-driven try_readd_removed_path() fails synchronously, the

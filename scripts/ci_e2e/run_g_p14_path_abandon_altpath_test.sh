@@ -4,12 +4,10 @@
 # run_g_p14_path_abandon_altpath_test.sh -- G-P14: PATH_ABANDON via alt-path.
 #
 # ACTIVE (un-skipped 2026-07-08). Formerly SKIPped on the belief that a netns
-# link-down (drop_path) emits no PATH_ABANDON wire frame. That is false: since
-# commit 0cd4136, drop_path() -> on_platform_path_dropped() calls
-# xqc_conn_close_path() -> xqc_path_immediate_close(), which writes a
-# PATH_ABANDON frame and sends it on a surviving alt-path. This test brings
-# path A down inside the client netns and asserts the server receives
-# PATH_ABANDON for path_id=0 via the alt-path -- exactly the G-P14 scenario.
+# A temporary link-down now deliberately retains its Path ID/CIDs, so it must
+# NOT be used to test PATH_ABANDON. This test deletes path A's interface
+# instead, which is the permanent RTM_DELLINK case and must send PATH_ABANDON
+# via the surviving alternate path.
 #
 # Confirmed on a real network (0% loss on the survivor, "G-P14 abandon on
 # alt-path" logged and processed by the server). The PR8 test-only
@@ -164,8 +162,8 @@ else
             sleep 2
 
             echo "=== Test: G-P14 PATH_ABANDON via alt-path ==="
-            echo "  Bringing veth-a0-gp14 down inside client netns..."
-            ip netns exec "$NS_CLIENT" ip link set "$VETH_A0" down
+            echo "  Deleting veth-a0-gp14 inside client netns..."
+            ip netns exec "$NS_CLIENT" ip link del "$VETH_A0"
 
             # Wait up to 10s for server to log PATH_ABANDON receipt for path_id=0
             ABANDON_OK=0

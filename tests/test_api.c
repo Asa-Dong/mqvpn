@@ -2744,6 +2744,47 @@ TEST(add_path_fd_with_outcome_invalid_args_return_minus_one)
     mqvpn_client_destroy(c);
 }
 
+/* A PATH_ABANDON completes asynchronously.  While eth0.101's old path is
+ * still draining, eth0.103 may already have a reusable CLOSED slot.  The
+ * recovery of 101 must wait; borrowing 103 overwrites its interface mapping,
+ * and appending another 101 leaves duplicate owners for that one underlay. */
+TEST(add_path_waits_for_matching_draining_slot)
+{
+    mqvpn_client_t *c = make_test_client();
+    mqvpn_path_desc_t p101 = {0};
+    mqvpn_path_desc_t p103 = {0};
+    p101.struct_size = sizeof(p101);
+    p103.struct_size = sizeof(p103);
+    snprintf(p101.iface, sizeof(p101.iface), "eth0.101");
+    snprintf(p103.iface, sizeof(p103.iface), "eth0.103");
+
+    mqvpn_path_handle_t h101 = mqvpn_client_add_path_fd(c, 42, &p101);
+    mqvpn_path_handle_t h103 = mqvpn_client_add_path_fd(c, 43, &p103);
+    ASSERT_NE(h101, (mqvpn_path_handle_t)-1);
+    ASSERT_NE(h103, (mqvpn_path_handle_t)-1);
+
+    /* Model the delayed cb_path_removed of 101: its slot is CLOSED but its
+     * xquic path is still live.  Make 103 fully reusable at the same time. */
+    ASSERT_EQ(mqvpn_client_test_force_validating(c, h101, 101), 0);
+    ASSERT_EQ(mqvpn_client_on_platform_path_dropped(c, h101, NULL), MQVPN_OK);
+    ASSERT_EQ(mqvpn_client_on_platform_fd_closed(c, h101), MQVPN_OK);
+    ASSERT_EQ(mqvpn_client_on_platform_path_dropped(c, h103, NULL), MQVPN_OK);
+    ASSERT_EQ(mqvpn_client_on_platform_fd_closed(c, h103), MQVPN_OK);
+
+    /* Re-add must defer rather than consume eth0.103 or append another 101. */
+    ASSERT_EQ(mqvpn_client_add_path_fd(c, 44, &p101), (mqvpn_path_handle_t)-1);
+
+    mqvpn_path_info_t info[MQVPN_MAX_PATHS];
+    int n = 0;
+    ASSERT_EQ(mqvpn_client_get_paths(c, info, MQVPN_MAX_PATHS, &n), MQVPN_OK);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(info[0].name, "eth0.101");
+    ASSERT_STR_EQ(info[1].name, "eth0.103");
+    ASSERT_EQ(info[1].status, MQVPN_PATH_CLOSED);
+
+    mqvpn_client_destroy(c);
+}
+
 /* ── Server client info ── */
 
 TEST(server_get_client_info_null_safety)
@@ -2937,6 +2978,7 @@ main(void)
     run_add_path_fd_with_outcome_null_outcome_acts_as_alias();
     run_add_path_fd_with_outcome_defers_to_ok_when_multipath_not_ready();
     run_add_path_fd_with_outcome_invalid_args_return_minus_one();
+    run_add_path_waits_for_matching_draining_slot();
 
     /* Server info tests */
     run_server_get_client_info_null_safety();

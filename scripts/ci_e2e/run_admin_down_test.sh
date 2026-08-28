@@ -333,7 +333,7 @@ ip netns exec "$NS_CLIENT" ip link set "$VETH_A0" up
 # the interface regaining a usable address, so it will not fire until
 # the RTM_NEWADDR below. This mimics the DHCP/NetworkManager delay.
 
-READD_PATTERN="path ${VETH_A0} re-added|timer re-added path ${VETH_A0}|reactivated path ${VETH_A0}"
+READD_PATTERN="path ${VETH_A0} re-added|timer re-added path ${VETH_A0}|reactivated path ${VETH_A0}|path ${VETH_A0} rebound with retained CID/Path ID"
 
 # Simulated DHCP/NetworkManager delay.
 sleep 2
