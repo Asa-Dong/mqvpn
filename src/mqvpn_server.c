@@ -441,6 +441,29 @@ cb_set_event_timer(xqc_usec_t wake_after, void *user_data)
     s->next_wake_us = wake_after;
 }
 
+/* xquic reports a RESET_STREAM as a failed read even though the H3 caller
+ * handles it as completion of that one request.  Match the bounded callback
+ * buffer without assuming it is NUL-terminated. */
+static int
+xqc_log_contains(const void *buf, size_t size, const char *marker)
+{
+    const unsigned char *p = buf;
+    const size_t marker_len = strlen(marker);
+    if (size < marker_len) return 0;
+    for (size_t i = 0; i <= size - marker_len; i++) {
+        if (memcmp(p + i, marker, marker_len) == 0) return 1;
+    }
+    return 0;
+}
+
+static int
+xqc_log_is_expected_noise(const void *buf, size_t size)
+{
+    return xqc_log_contains(buf, size, "xqc_stream_recv error|-626|")
+        || xqc_log_contains(buf, size,
+            "peer validated address while inflight bytes is 0");
+}
+
 static void
 cb_xqc_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_data)
 {
@@ -458,6 +481,12 @@ cb_xqc_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_d
     mqvpn_log_level_t ml;
     switch (lvl) {
     case XQC_LOG_REPORT:
+        /* REPORT carries per-request close statistics.  It is dispatched
+         * through xqc_log_write_stat, so presenting it as an error made
+         * normal Hybrid TCP stream completion look like a transport fault.
+         * Keep it available at debug instead of writing every short flow. */
+        ml = MQVPN_LOG_DEBUG;
+        break;
     case XQC_LOG_FATAL:
     case XQC_LOG_ERROR: ml = MQVPN_LOG_ERROR; break;
     case XQC_LOG_WARN: ml = MQVPN_LOG_WARN; break;
@@ -466,6 +495,14 @@ cb_xqc_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_d
     case XQC_LOG_DEBUG:
     default: ml = MQVPN_LOG_DEBUG; break;
     }
+
+    /* The loss-timer message is an xquic assertion fallback: it only logs
+     * and returns, and does not change connection/path state.  It can recur
+     * once per armed timer on idle validated connections.  Preserve it for
+     * debug diagnosis, but avoid flooding normal daemon.warn output. */
+    if ((lvl == XQC_LOG_ERROR || lvl == XQC_LOG_WARN)
+        && xqc_log_is_expected_noise(buf, size))
+        ml = MQVPN_LOG_DEBUG;
 
     if (ml < s->log_level) return;
 
