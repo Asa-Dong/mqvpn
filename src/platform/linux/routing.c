@@ -57,15 +57,51 @@ run_ip_capture(const char *const argv[], char *out, size_t out_len)
     }
 
     close(fds[1]);
-    ssize_t nread = read(fds[0], out, out_len - 1);
+    /* Read until EOF. `ip -4
+     * route get` prints two lines (the route, then "    cache"), and a
+     * musl-linked iproute2 (Alpine, OpenWrt) writes them with two separate
+     * write()s: musl's stdout is line-buffered until its first flush. A
+     * single read() can therefore return only the first line; closing the
+     * pipe then kills `ip` with SIGPIPE on its second write (Linux clients
+     * keep the default disposition, which survives exec), and the
+     * WIFEXITED check below discards an answer that was already complete,
+     * aborting the tunnel with "could not determine original iface".
+     * Retry EINTR; treat buffer-full-before-EOF as a failed capture. */
+    size_t used = 0;
+    int read_failed = 0, overflowed = 0;
+    for (;;) {
+        if (used >= out_len - 1) {
+            /* Buffer full — probe one more byte to distinguish "output
+             * exactly fits" from truncation. */
+            char probe;
+            ssize_t r = read(fds[0], &probe, 1);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                read_failed = 1;
+            } else if (r > 0) {
+                overflowed = 1;
+            }
+            break;
+        }
+        ssize_t r = read(fds[0], out + used, out_len - 1 - used);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            read_failed = 1;
+            break;
+        }
+        if (r == 0) break; /* EOF */
+        used += (size_t)r;
+    }
     close(fds[0]);
 
     int status = 0;
     while (waitpid(pid, &status, 0) < 0)
         if (errno != EINTR) return -1;
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || nread < 0) return -1;
+    if (read_failed || overflowed || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        used == 0)
+        return -1;
 
-    out[nread] = '\0';
+    out[used] = '\0';
     return 0;
 }
 

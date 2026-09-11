@@ -813,6 +813,18 @@ if(BUILD_TESTING)
         add_test(NAME ${t} COMMAND ${t})
     endforeach()
 
+    # Linux routing regression: ip route get may arrive in two writes on
+    # musl/OpenWrt, so route discovery must drain the child pipe to EOF.
+    add_executable(test_routing_linux
+        tests/test_routing_linux.c src/platform/linux/routing.c
+        src/platform/posix/dns_common.c src/log.c)
+    target_include_directories(test_routing_linux PRIVATE
+        ${EVENT_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/platform/posix ${CMAKE_SOURCE_DIR}/src/platform/linux)
+    set_target_properties(test_routing_linux PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_routing_linux COMMAND test_routing_linux)
+
     # UDP GSO TX offload (issue #167): pure syscall/mechanics layer, no xquic
     # dependency. MQVPN_OFFLOAD_TEST_SEAM is wired: it swaps sendmsg/sendmmsg
     # for mqvpn_seam_sendmsg/mqvpn_seam_sendmmsg (defined in
