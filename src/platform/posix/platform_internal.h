@@ -99,6 +99,10 @@ typedef struct {
 
     /* Shutdown */
     int shutting_down;
+    /* Local tunnel setup failed and cannot be retried in process. A transient
+     * route failure during R4S DHCP handover instead schedules reconnect.
+     * Read after the event loop returns to exit non-zero. */
+    int fatal_error;
 
     /* Path recovery event source (per-OS: netlink on Linux, PF_ROUTE on Darwin) */
 #if defined(__linux__)

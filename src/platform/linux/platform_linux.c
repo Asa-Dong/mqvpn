@@ -81,6 +81,7 @@ static void
 cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
 {
     platform_ctx_t *p = (platform_ctx_t *)user_ctx;
+    int retryable_route_failure = 0;
 
     /* Clean up stale TUN event from previous connection (reconnect case) */
     if (p->ev_tun) {
@@ -140,6 +141,7 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
     if (p->manage_routes) {
         if (setup_routes(p) < 0) {
             LOG_ERR("route setup failed, aborting tunnel");
+            retryable_route_failure = 1;
             goto fail;
         }
     } else {
@@ -196,13 +198,17 @@ fail:
     if (p->tun.fd >= 0) mqvpn_tun_destroy(&p->tun);
     p->tun.fd = -1;
     p->tun_up = 0;
-    /* A DHCP/netifd handover can briefly leave no main-table default route
-     * precisely while the replacement MQVPN connection reaches TUN_READY.
-     * This is transient: keep the process alive and let its normal reconnect
-     * timer retry after the physical underlay has settled. */
-    LOG_WRN("tunnel platform setup failed; requesting in-process reconnect");
-    if (mqvpn_client_reconnect(p->client) != MQVPN_OK)
-        LOG_ERR("failed to schedule reconnect after tunnel platform setup failure");
+    /* R4S treats a missing default route during DHCP handover as transient.
+     * All other local setup failures need a non-zero process exit so the
+     * supervisor can report and restart a broken host configuration. */
+    if (retryable_route_failure) {
+        LOG_WRN("route setup failed; requesting in-process reconnect");
+        if (mqvpn_client_reconnect(p->client) == MQVPN_OK) return;
+        LOG_ERR("failed to schedule reconnect after route setup failure");
+    }
+    p->fatal_error = 1;
+    p->shutting_down = 1;
+    mqvpn_client_disconnect(p->client);
 }
 
 static void
@@ -750,7 +756,8 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
 
     LOG_INF("entering event loop...");
     event_base_dispatch(ctx.eb);
-    rc = 0;
+    rc = ctx.fatal_error ? 1 : 0;
+    if (rc) LOG_ERR("exiting: tunnel setup failed");
 
 cleanup:
     /* Stop the query callback before client destruction below. */
