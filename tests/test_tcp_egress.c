@@ -23,6 +23,7 @@
 #include "hybrid/tcp_egress.h"
 #include "mqvpn_conn_settings.h"
 #include "mqvpn_internal.h"
+#include "mqvpn_server_internal.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -614,7 +615,19 @@ typedef struct {
     mqvpn_server_t *svr;
     probe_conn_t probe;
     harness_egress_fd_t egress_fds[HARNESS_MAX_EGRESS_FDS];
+    int idle_close_logs;
+    int egress_dispatches;
+    int freeze_probe; /* Leave H3 close unacknowledged while testing fd teardown. */
 } harness_t;
+
+static void
+harness_server_log(mqvpn_log_level_t level, const char *msg, void *user_ctx)
+{
+    (void)level;
+    harness_t *h = (harness_t *)user_ctx;
+    if (strstr(msg, "idle for over") && strstr(msg, "closing stream"))
+        h->idle_close_logs++;
+}
 
 /* mqvpn_server_callbacks_t.egress_fd_register implementation: records/
  * updates one slot in h->egress_fds, keyed by fd. Passed mqvpn_server_new's
@@ -729,6 +742,7 @@ harness_start(harness_t *h, const char *protocol, size_t protocol_len, int auto_
         mqvpn_server_callbacks_t svr_cbs = MQVPN_SERVER_CALLBACKS_INIT;
         svr_cbs.tun_output = counting_tun_output;
         svr_cbs.tunnel_config_ready = noop_tunnel_config_ready;
+        svr_cbs.log = harness_server_log;
         svr_cbs.egress_fd_register = harness_egress_fd_register;
         svr_cbs.egress_fd_unregister = harness_egress_fd_unregister;
 
@@ -809,7 +823,7 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
             mqvpn_server_on_socket_recv(h->svr, buf, (size_t)n, (struct sockaddr *)&from,
                                         from_len);
         }
-        for (;;) {
+        for (; !h->freeze_probe;) {
             from_len = sizeof(from);
             ssize_t n = recvfrom(h->cli_fd, buf, sizeof(buf), MSG_DONTWAIT,
                                  (struct sockaddr *)&from, &from_len);
@@ -840,6 +854,7 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
             if (poll(&epfd, 1, 0) > 0 && epfd.revents != 0) {
                 int readable = (epfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
                 int writable = (epfd.revents & (POLLOUT | POLLERR)) != 0;
+                h->egress_dispatches++;
                 mqvpn_server_on_egress_fd_ready(h->svr, h->egress_fds[i].fd,
                                                 h->egress_fds[i].fd_ctx, readable,
                                                 writable);
@@ -847,7 +862,7 @@ harness_pump(harness_t *h, const int *done, int budget_ms)
         }
 
         mqvpn_server_tick(h->svr);
-        xqc_engine_main_logic(h->probe.engine);
+        if (!h->freeze_probe) xqc_engine_main_logic(h->probe.engine);
 
         if (*done) break;
 
@@ -1261,6 +1276,13 @@ harness_cfg_allow_127_idle_timeout_1(mqvpn_config_t *cfg)
         printf("FAIL\n    mqvpn_config_set_hybrid_limits rejected valid input\n");
         exit(1);
     }
+}
+
+static void
+harness_cfg_allow_127_idle_timeout_1_info(mqvpn_config_t *cfg)
+{
+    harness_cfg_allow_127_idle_timeout_1(cfg);
+    mqvpn_config_set_log_level(cfg, MQVPN_LOG_INFO);
 }
 
 /* Injects an INVALID hybrid scalar the way the INI/JSON bridge does —
@@ -1985,6 +2007,72 @@ TEST(mqvpn_tcp_downlink_backpressure_pause_resume)
     free(h.probe.raw_recv_buf);
 }
 
+/* A downlink-paused flow asks the reactor for writable events. After the
+ * upstream TCP socket resets, the first writable dispatch must tear down
+ * that fd even if the H3 peer never answers the stream reset. Otherwise
+ * every subsequent dispatch retries send() and repeats the relay error. */
+static int
+harness_egress_wants_write(const harness_t *h)
+{
+    for (int i = 0; i < HARNESS_MAX_EGRESS_FDS; i++)
+        if (h->egress_fds[i].active && h->egress_fds[i].want_write) return 1;
+    return 0;
+}
+
+TEST(mqvpn_tcp_relay_error_stops_fd_dispatch)
+{
+    tcp_sink_t sink;
+    ASSERT_EQ(tcp_sink_open(&sink, /*echo=*/0), 0);
+    int rcvbuf = 4096;
+    ASSERT_EQ(setsockopt(sink.listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)),
+              0);
+
+    char path[64];
+    snprintf(path, sizeof(path), "/.well-known/mqvpn/tcp/127.0.0.1/%d/", sink.port);
+
+    harness_t h;
+    ASSERT_EQ(harness_start(&h, "mqvpn-tcp", 9, /*auto_open=*/0, harness_cfg_allow_127),
+              0);
+    h.probe.path = path;
+    h.probe.raw_capture = 1;
+
+    harness_pump(&h, &h.probe.handshake_done, 10000);
+    ASSERT_EQ(h.probe.handshake_done, 1);
+    ASSERT_EQ(probe_open_request_with_body(&h.probe), 0);
+    harness_pump_with_sink(&h, &sink, &h.probe.response_done, 10000);
+    ASSERT_EQ(h.probe.response_done, 1);
+    ASSERT_STREQ(h.probe.status, "200");
+    ASSERT_EQ(sink.conn_fd >= 0, 1);
+
+    uint8_t chunk[16384];
+    memset(chunk, 0xA5, sizeof(chunk));
+    for (int i = 0; i < 2000 && !harness_egress_wants_write(&h); i++) {
+        ssize_t sent = xqc_h3_request_send_body(h.probe.req, chunk, sizeof(chunk), 0);
+        ASSERT_EQ(sent > 0 || sent == -XQC_EAGAIN, 1);
+        int never = 0;
+        harness_pump(&h, &never, 20);
+    }
+    ASSERT_EQ(harness_egress_wants_write(&h), 1);
+
+    h.freeze_probe = 1;
+    struct linger lg = {.l_onoff = 1, .l_linger = 0};
+    ASSERT_EQ(setsockopt(sink.conn_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)), 0);
+    close(sink.conn_fd);
+    sink.conn_fd = -1;
+
+    h.egress_dispatches = 0;
+    for (int i = 0; i < 50; i++) {
+        int never = 0;
+        harness_pump(&h, &never, 1);
+    }
+    ASSERT_EQ(h.egress_dispatches, 1);
+
+    h.freeze_probe = 0;
+    harness_stop(&h);
+    tcp_sink_close(&sink);
+    free(h.probe.raw_recv_buf);
+}
+
 /* Closing-notify idempotency. (Uplink -XQC_EAGAIN coverage note: the
  * stash-WRITE half of that path — send_body backpressure parking the flow
  * via svr_tcp_egress_stash_uplink — IS exercised by
@@ -2035,6 +2123,47 @@ TEST(mqvpn_tcp_closing_notify_idempotent)
     harness_stop(&h);
     tcp_sink_close(&sink);
     free(h.probe.raw_recv_buf);
+}
+
+/* An idle eviction releases its fd and admission slot before the H3 close
+ * callback, and repeated ticks must produce only one close log. */
+TEST(mqvpn_tcp_idle_close_requested_once)
+{
+    tcp_sink_t sink;
+    ASSERT_EQ(tcp_sink_open(&sink, /*echo=*/1), 0);
+
+    char path[64];
+    snprintf(path, sizeof(path), "/.well-known/mqvpn/tcp/127.0.0.1/%d/", sink.port);
+
+    harness_t h;
+    ASSERT_EQ(harness_start(&h, "mqvpn-tcp", 9, /*auto_open=*/0,
+                            harness_cfg_allow_127_idle_timeout_1_info), 0);
+    h.probe.path = path;
+    harness_pump(&h, &h.probe.handshake_done, 10000);
+    ASSERT_EQ(h.probe.handshake_done, 1);
+    ASSERT_EQ(probe_open_request_with_body(&h.probe), 0);
+    harness_pump_with_sink(&h, &sink, &h.probe.response_done, 10000);
+    ASSERT_EQ(h.probe.response_done, 1);
+    ASSERT_STREQ(h.probe.status, "200");
+
+    /* Expire this ACTIVE flow without advancing either QUIC engine. The H3
+     * close callback is still pending, but the egress fd and admission slot
+     * must already be gone. Repeated sweeps must not log again. */
+    uint64_t expired_us = test_now_us() + 2000000ull;
+    svr_tcp_egress_tick(h.svr, expired_us);
+    ASSERT_EQ(h.idle_close_logs, 1);
+    svr_tcp_egress_srv_ctx_t ctx;
+    svr_get_tcp_egress_ctx(h.svr, &ctx);
+    ASSERT_EQ(*ctx.global_fd_count, 0);
+    ASSERT_EQ(*ctx.flow_list_head == NULL, 1);
+    for (int i = 0; i < HARNESS_MAX_EGRESS_FDS; i++)
+        ASSERT_EQ(h.egress_fds[i].active, 0);
+    for (int i = 0; i < 100; i++)
+        svr_tcp_egress_tick(h.svr, expired_us + (uint64_t)i);
+    ASSERT_EQ(h.idle_close_logs, 1);
+
+    harness_stop(&h);
+    tcp_sink_close(&sink);
 }
 
 /* ── Limits (Step 2): ACTIVE-flow idle timeout eviction ──
@@ -2128,8 +2257,7 @@ TEST(mqvpn_tcp_active_idle_timeout_evicts)
  * deterministic: the D3 list head-inserts, so the walk visits flow 2 (head)
  * then flow 1 — evicting the head with a LIVE successor is exactly the
  * mid-walk-unlink case the save-next discipline in svr_tcp_egress_tick
- * exists for (on_idle_evict's xqc_h3_request_close can synchronously
- * re-enter the close-notify funnel and unlink+free the flow mid-walk).
+ * exists for (on_idle_evict releases the flow before closing H3).
  * Honest caveat on "same pass": alignment is to microseconds against a >=1s
  * sweep period, so a tick landing between the two deadlines is vanishingly
  * unlikely but not impossible — what this test pins HARD is head-eviction
@@ -2910,7 +3038,9 @@ main(void)
     run_mqvpn_tcp_h3_fin_becomes_shut_wr();
     run_mqvpn_tcp_bodiless_fin_becomes_shut_wr();
     run_mqvpn_tcp_downlink_backpressure_pause_resume();
+    run_mqvpn_tcp_relay_error_stops_fd_dispatch();
     run_mqvpn_tcp_closing_notify_idempotent();
+    run_mqvpn_tcp_idle_close_requested_once();
     run_mqvpn_tcp_active_idle_timeout_evicts();
     run_mqvpn_tcp_two_flow_same_conn_idle_eviction();
     run_mqvpn_tcp_parked_flow_idle_eviction();
