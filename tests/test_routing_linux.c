@@ -151,10 +151,10 @@ test_happy_path(fake_cmd_env_t *e)
 }
 
 /* ================================================================
- * 2. on-link server (route get has no `via`) -> no pin route at all
+ * 2. on-link server (route get has no `via`) -> pin through the device
  * ================================================================ */
 static void
-test_onlink_no_pin(fake_cmd_env_t *e)
+test_onlink_pin(fake_cmd_env_t *e)
 {
     fake_cmd_reset(e);
     set_route_get_output(e, "203.0.113.9 dev eth0 src 192.0.2.5 uid 0\n");
@@ -163,20 +163,19 @@ test_onlink_no_pin(fake_cmd_env_t *e)
     init_ctx(&p);
 
     int rc = setup_routes(&p);
-    ASSERT_EQ_INT(rc, 0, "onlink-no-pin rc");
-    ASSERT_EQ_INT(p.routing_configured, 1, "onlink-no-pin routing_configured");
-    ASSERT_TRUE(p.orig_gateway[0] == '\0', "onlink-no-pin: orig_gateway parsed as empty");
+    ASSERT_EQ_INT(rc, 0, "onlink-pin rc");
+    ASSERT_EQ_INT(p.routing_configured, 1, "onlink-pin routing_configured");
+    ASSERT_TRUE(p.orig_gateway[0] == '\0', "onlink-pin: orig_gateway parsed as empty");
 
     char log[4096];
     fake_cmd_read_log(e, log, sizeof(log));
     const char *seq[] = {
         "ip|-4|route|get|203.0.113.9",
+        "ip|-4|route|replace|203.0.113.9/32|dev|eth0",
         "ip|route|replace|0.0.0.0/1|dev|mqvpn0",
         "ip|route|replace|128.0.0.0/1|dev|mqvpn0",
     };
-    assert_log_order(log, seq, 3, "onlink-no-pin setup sequence");
-    ASSERT_TRUE(strstr(log, "replace|203.0.113.9/32") == NULL,
-                "onlink-no-pin: no pin route ever added");
+    assert_log_order(log, seq, 4, "onlink-pin setup sequence");
 
     fake_cmd_reset(e);
     cleanup_routes(&p);
@@ -184,11 +183,11 @@ test_onlink_no_pin(fake_cmd_env_t *e)
     /* Full-invocation needles (anchored at the command name): a bare
      * "del|..." would also match an erroneous `ip -6 route del ...`. */
     ASSERT_TRUE(strstr(log, "ip|route|del|0.0.0.0/1|dev|mqvpn0") != NULL,
-                "onlink-no-pin cleanup deletes low catch-all");
+                "onlink-pin cleanup deletes low catch-all");
     ASSERT_TRUE(strstr(log, "ip|route|del|128.0.0.0/1|dev|mqvpn0") != NULL,
-                "onlink-no-pin cleanup deletes high catch-all");
-    ASSERT_TRUE(strstr(log, "del|203.0.113.9/32") == NULL,
-                "onlink-no-pin cleanup: no pin route to delete");
+                "onlink-pin cleanup deletes high catch-all");
+    ASSERT_TRUE(strstr(log, "ip|-4|route|del|203.0.113.9/32|dev|eth0") != NULL,
+                "onlink-pin cleanup deletes pin route");
 }
 
 /* ================================================================
@@ -526,7 +525,7 @@ main(void)
     setup_fixture(&e);
 
     test_happy_path(&e);
-    test_onlink_no_pin(&e);
+    test_onlink_pin(&e);
     test_catchall_failure_rollback(&e);
     test_v6_catchalls(&e);
     test_v6_high_failure_rollback(&e);
